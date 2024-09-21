@@ -1,0 +1,6 @@
+[submodule "dropbear"]
+	path = dropbear
+	url = git@github.com:yuvalino/dropbear-forkless.git
+[submodule "mksh"]
+	path = mksh
+	url = git@github.com:yuvalino/mksh-forkless.git
