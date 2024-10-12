@@ -29,8 +29,7 @@
  * TODOs:
  * 1. thread exits
  * 2. signals - masks
- * 3. sockets
- * 4. syscalls: prctl, posix_fadvise, posix_fallocate, posix_openpt, grantpt, ptsname, unlockpt
+ * 4. syscalls: posix_fadvise, posix_fallocate, posix_openpt, grantpt, ptsname, unlockpt
  */
 
 #define LOCAL_SYM(Name) o_##Name
@@ -55,6 +54,8 @@ static void __panic(const char *m, const char *f, int l);
 #define container_of(ptr, type, member) ({                      \
         const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
         (type *)((char *)__mptr - offsetof(type,member));})
+
+#define INFO(Msg, ...) do { CALL_FUNC(printf, "Kernel(%d): " Msg "\n", __gettid(), ##__VA_ARGS__); } while (0)
 
 /////////////
 // Functions
@@ -384,6 +385,7 @@ static void *__getstack(size_t *outsize)
     r = pthread_attr_getstack(&attr, &sp, outsize);
     if (r != 0)
         panic("pthread_attr_getstack() failed (%d)", r);
+    INFO("__getstack ptr=%p size=0x%lx (sp=%p)", sp, *outsize, &sp);
     pthread_attr_destroy(&attr);
 #endif
     if (sp == NULL || *outsize == 0)
@@ -467,6 +469,39 @@ static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
     }
 }
 
+static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, size_t new_stack_size, uintptr_t old_stack, size_t old_stack_size, int entire)
+{
+    void *a;
+    // INFO("   current stack: %p\n", &a);
+    // INFO("jmpbuf_dupstack: old 0x%lx (%lx) new 0x%lx (%lx)", old_stack, old_stack_size, new_stack, new_stack_size);
+    uintptr_t jmpbuf_old_sp = (uintptr_t) jmpbuf_getstack(jmpbuf);
+
+    if (!(jmpbuf_old_sp >= old_stack && jmpbuf_old_sp < (old_stack + old_stack_size)))
+        panic("jmpbuf_dupstack: jmpbuf's sp not in old_stack");
+
+    uintptr_t jmpbuf_depth = old_stack + old_stack_size - jmpbuf_old_sp;
+
+    // INFO("jmpbuf_dupstack:  depth 0x%lx (sp=%lx)", jmpbuf_depth, jmpbuf_old_sp);
+
+    if (entire && jmpbuf_depth > new_stack_size)
+        panic("jmpbuf_dupstack: entire and new_stack_size is smaller than depth (need bigger stack!)");
+    
+    if (jmpbuf_depth > new_stack_size) {
+        uintptr_t diff = jmpbuf_depth - new_stack_size;
+        old_stack_size -= diff;
+        jmpbuf_depth -= diff;
+        // INFO("jmpbuf_dupstack: fixup! diff=0x%lx", diff);
+    }
+    
+    memcpy(
+        (void *) (new_stack + new_stack_size - jmpbuf_depth),
+        (void *) jmpbuf_old_sp,
+        jmpbuf_depth
+    );
+
+    jmpbuf_setstack(jmpbuf, new_stack + new_stack_size - jmpbuf_depth, jmpbuf_old_sp, jmpbuf_depth);
+}
+
 #undef PTR_MANGLE
 #undef PTR_DEMANGLE
 
@@ -515,10 +550,17 @@ struct task
     struct list_head tsk_pthreads;  // pthread_entry
 };
 
+struct thread
+{
+    void *thr_stack;
+    size_t thr_stacksize;
+};
+
 static pthread_t main_pthread;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
+static __thread struct thread *current_thread;
 
 static void task_lock(struct task *t)
 {
@@ -820,6 +862,9 @@ static void terminate_current_locked(int result)
         pthread_cond_signal(&parent->tsk_wait_cond);
     }
 
+    if (current_thread)
+        free(current_thread);
+
     CALL_FUNC(pthread_exit, 0);
     __builtin_unreachable();
 }
@@ -902,6 +947,7 @@ static const int default_signal_actions[MAX_SIGNALS] = {
 
 void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
+    INFO("signal %d\n", signum);
     if (!current)
         panic("signal %d on pthread_exit", signum);
     
@@ -944,10 +990,101 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     return hand(signum, siginfo, ucontext);
 }
 
+/////////////
+// Forkless API
+/////////////
+
+#define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
+
+struct forkless_arg {
+    jmp_buf jmpbuf;
+    jmp_buf jmpbuf_trampoline;
+    void *parent_stack;
+    size_t parent_stack_size;
+    char tmpstack[0x8000];
+};
+
+static void forkless_entry_trampoline(struct forkless_arg *arg)
+{
+    //INFO("forkless_entry_trampoline(%p)", arg);
+    
+    jmpbuf_dupstack(
+        &arg->jmpbuf,
+        (uintptr_t) current_thread->thr_stack,
+        current_thread->thr_stacksize,
+        (uintptr_t) arg->parent_stack,
+        arg->parent_stack_size,
+        1
+    );
+    jmpbuf_mangle(&arg->jmpbuf);
+
+    //INFO("forkless_entry_trampoline longjmp");
+    longjmp(arg->jmpbuf, 1);
+}
+
+static void *forkless_entry(struct forkless_arg *arg)
+{
+    INFO("forkless_entry (%p)", arg);
+    if (0 != setjmp(arg->jmpbuf_trampoline)) {
+        //INFO("forkless_entry setjmp");
+        forkless_entry_trampoline(arg);
+    }
+    
+    jmpbuf_demangle(&arg->jmpbuf_trampoline);
+    jmpbuf_dupstack(
+        &arg->jmpbuf_trampoline,
+        (uintptr_t) arg->tmpstack,
+        sizeof(arg->tmpstack),
+        (uintptr_t) current_thread->thr_stack,
+        current_thread->thr_stacksize,
+        0
+    );
+    jmpbuf_mangle(&arg->jmpbuf_trampoline);
+
+    INFO("forkless_entry longjmp");
+    longjmp(arg->jmpbuf_trampoline, 1);
+}
+
+pid_t forkless()
+{
+    INFO("forkless");
+    pid_t pid = -1;
+    struct forkless_arg arg = {
+        .parent_stack = current_thread->thr_stack,
+        .parent_stack_size = current_thread->thr_stacksize,
+    };
+    pid_t *pidaddr = (pid_t *) (((uintptr_t) &pid) ^ FORKLESS_STACK_MAGIC);
+    
+    // NOTE: Why do we xor `pidaddr`?
+    //       `jmpbuf_setstack` fixes up every pointer in the old stack to the new stack.
+    //       This would also make `pidaddr` point to the new stack. But we don't want that,
+    //       because we're notifying the parent the child has finished setting up.
+
+    if (0 != setjmp(arg.jmpbuf)) {
+        pidaddr = (pid_t *) (((uintptr_t) pidaddr) ^ FORKLESS_STACK_MAGIC);
+        *pidaddr = __gettid();
+        return 0;
+    }
+    jmpbuf_demangle(&arg.jmpbuf);
+
+    // TODO: make sure `(__builtin_frame_address(0) - getstack(jmpbuf)) < (sizeof(forkless_entry::frame_data) / 2)`
+    // TODO: check parent stack pointer validity
+    pthread_t thr;
+    tvm_pthread_fork(&thr, NULL, (void *(*)(void *)) forkless_entry, (void *)&arg);
+    
+    while (pid == -1) {}
+    INFO("forkless end (%d)", pid);
+    return pid;
+}
+
 // control functions
 
 void tvm_init()
 {
+    if (NULL == (current_thread = malloc(sizeof(struct thread))))
+        panic("tvm_init thread");
+    current_thread->thr_stack = __getstack(&current_thread->thr_stacksize);
+
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
 
@@ -989,62 +1126,6 @@ static void __panic(const char *msg, const char *file, int line)
 }
 
 /////////////
-// Forkless API
-/////////////
-
-#define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
-
-struct forkless_arg {
-    jmp_buf jmpbuf;
-    void *stack;
-    void *parent_stack;
-    size_t stack_size;
-};
-
-static void *forkless_entry(struct forkless_arg *arg)
-{
-    jmpbuf_mangle(&arg->jmpbuf);
-    longjmp(arg->jmpbuf, 1);
-}
-
-pid_t forkless()
-{
-    pid_t pid = -1;
-    struct forkless_arg arg;
-    pid_t *pidaddr = (pid_t *) (((uintptr_t) &pid) ^ FORKLESS_STACK_MAGIC);
-
-    // NOTE: Why do we xor `pidaddr`?
-    //       `jmpbuf_setstack` fixes up every pointer in the old stack to the new stack.
-    //       This would also make `pidaddr` point to the new stack. But we don't want that,
-    //       because we're notifying the parent the child has finished setting up.
-
-    if (0 != setjmp(arg.jmpbuf)) {
-        pidaddr = (pid_t *) (((uintptr_t) pidaddr) ^ FORKLESS_STACK_MAGIC);
-        *pidaddr = __gettid();
-        return 0;
-    }
-
-    // Setup new stack as mirror of parent stack
-    arg.parent_stack = __getstack(&arg.stack_size);
-    arg.stack = malloc(arg.stack_size);
-    if (!arg.stack)
-        panic("arg.stack");
-    memcpy(arg.stack, arg.parent_stack, arg.stack_size);
-
-    // TODO: make sure `(__builtin_frame_address(0) - getstack(jmpbuf)) < (sizeof(forkless_entry::frame_data) / 2)`
-
-    // Fixup pointers on jmpbuf and new stack that were pointing to old stack
-    jmpbuf_demangle(&arg.jmpbuf);
-    jmpbuf_setstack(&arg.jmpbuf, (uintptr_t)arg.stack, (uintptr_t)arg.parent_stack, arg.stack_size);
-
-    pthread_t thr;
-    tvm_pthread_fork(&thr, NULL, (void *(*)(void *)) forkless_entry, (void *)&arg);
-    
-    while (pid == -1) {}
-    return pid;
-}
-
-/////////////
 // tvm_pthread_* API
 /////////////
 
@@ -1053,6 +1134,7 @@ struct thread_arg
     int flags;
     struct task *task;
     struct pthread_entry *pentry;
+    struct thread *thread;
     void *(*start_routine) (void *);
     void *arg;
 };
@@ -1064,6 +1146,9 @@ static void *thread_entry(void *arg)
     free(arg);
 
     current = targ.task;
+    current_thread = targ.thread;
+
+    INFO("thread_entry ptr=%p size=0x%lx (sp=%p)", current_thread->thr_stack, current_thread->thr_stacksize, &targ);
 
     task_lock(current);
 
@@ -1081,9 +1166,13 @@ static void *thread_entry(void *arg)
     __builtin_unreachable();
 }
 
-int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg, int flags)
+int tvm_pthread_create_ex(pthread_t *thread, pthread_attr_t *attr, void *(*start_routine) (void *), void *arg, int flags)
 {
     int ret = ENOMEM;
+    int has_local_attr = 0;
+    pthread_attr_t local_attr;
+    int has_local_stack = 0;
+
     struct thread_arg *targ = malloc(sizeof(struct thread_arg));
     if (!targ)
         goto out;
@@ -1107,9 +1196,35 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
         task_unlock(current);
     }
 
+    targ->thread = malloc(sizeof(struct thread));
+    if (!targ->thread)
+        goto out;
+    memset(targ->thread, 0, sizeof(struct thread));
+
+    if (NULL == attr) {
+        has_local_attr = 1;
+        attr = &local_attr;
+        pthread_attr_init(attr);
+    }
+
+    pthread_attr_getstack(attr, &targ->thread->thr_stack, &targ->thread->thr_stacksize);
+
+    if (!targ->thread->thr_stacksize) {
+        targ->thread->thr_stacksize = current_thread->thr_stacksize;
+        pthread_attr_setstacksize(attr, targ->thread->thr_stacksize);
+    }
+
+    if (!targ->thread->thr_stack) {
+        has_local_stack = 1;
+        targ->thread->thr_stack = malloc(targ->thread->thr_stacksize);
+        if (!targ->thread->thr_stack)
+            goto out;
+        pthread_attr_setstack(attr, targ->thread->thr_stack, targ->thread->thr_stacksize);
+    }
+
     targ->start_routine = start_routine;
     targ->arg = arg;
-    
+
     ret = CALL_FUNC(pthread_create, thread, attr, thread_entry, (void *)targ);
     
 out:
@@ -1117,6 +1232,12 @@ out:
     {
         if (targ)
         {
+            if (targ->thread) {
+                if (has_local_stack && targ->thread->thr_stack)
+                    free(targ->thread->thr_stack);
+                free(targ->thread);
+            }
+            
             if (flags & TVM_PTHREAD_FORK)
             {
                 if (targ->task)
@@ -1137,13 +1258,17 @@ out:
         }
     }
 
+    if (has_local_attr) {
+        pthread_attr_destroy(attr);
+    }
+
     return ret;
 }
 
-int tvm_pthread_fork(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
+int tvm_pthread_fork(pthread_t *thread, pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
 { return tvm_pthread_create_ex(thread, attr, start_routine, arg, TVM_PTHREAD_FORK); }
 
-int tvm_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
+int tvm_pthread_create(pthread_t *thread, pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
 { return tvm_pthread_create_ex(thread, attr, start_routine, arg, 0); }
 
 __attribute__ ((noreturn))
@@ -1739,7 +1864,7 @@ int ioctl(int fd, unsigned long request, ...)
 }
 
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
-    return tvm_pthread_create(thread, attr, start_routine, arg);
+    return tvm_pthread_create(thread, (pthread_attr_t *)attr, start_routine, arg);
 }
 
 void pthread_exit(void *retval) { tvm_pthread_exit(retval); }

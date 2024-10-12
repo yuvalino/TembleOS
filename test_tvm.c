@@ -39,25 +39,35 @@ TEST(ProcWait) {
 }
 
 TEST(ProcExit) {
+    printf("begin\n");
 
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
-    if (!p)
+    if (!p) {
+        printf("p 1\n");
         exit(25);
+    }
+        
     int s;
     ASSERT_EQ(p, wait(&s));
     ASSERT_EQ(WIFEXITED(s), 1);
     ASSERT_EQ(WIFSIGNALED(s), 0);
     ASSERT_EQ(WEXITSTATUS(s), 25);
 
+    printf("again\n");
+
     p = fork();
     ASSERT_NEQ(p, -1);
-    if (!p)
+    if (!p) {
+        printf("p 2");
         exit(26);
+    }
     ASSERT_EQ(p, wait(&s));
     ASSERT_EQ(WIFEXITED(s), 1);
     ASSERT_EQ(WIFSIGNALED(s), 0);
     ASSERT_EQ(WEXITSTATUS(s), 26);
+
+    printf("done\n");
 }
 
 TEST(ProcRaise) {
@@ -100,6 +110,7 @@ TEST(ProcParent) {
     ASSERT_NEQ(p1, -1);
 
     if (!p1) {
+        printf("[%d] p1 start\n", getpid());
         if (0 != close(pip[0]))
             exit(1);
 
@@ -108,6 +119,7 @@ TEST(ProcParent) {
             exit(2);
 
         if (!p_2) {
+            printf("[%d] p2 start\n", getpid());
             pid_t pz_1 = getppid();
             usleep(200000); // wait for p1 to die
             pid_t pz_2 = getppid();
@@ -118,6 +130,7 @@ TEST(ProcParent) {
             if (sizeof(pz_2) != write(pip[1], &pz_2, sizeof(pz_2)))
                 exit(4);
             
+            printf("[%d] p2 end\n", getpid());
             exit(0);
         }
         
