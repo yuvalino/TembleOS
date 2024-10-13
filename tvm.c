@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <unistd.h>
 #include <errno.h>
@@ -55,7 +56,7 @@ static void __panic(const char *m, const char *f, int l);
         const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
         (type *)((char *)__mptr - offsetof(type,member));})
 
-#define INFO(Msg, ...) do { CALL_FUNC(printf, "Kernel(%d): " Msg "\n", __gettid(), ##__VA_ARGS__); } while (0)
+#define INFO(Msg, ...) do { CALL_FUNC(printf, "Kernel(%d): %s: " Msg "\n", __gettid(), __FUNCTION__, ##__VA_ARGS__); } while (0)
 
 /////////////
 // Functions
@@ -373,26 +374,6 @@ static pid_t __gettid()
 #endif
 }
 
-static void *__getstack(size_t *outsize)
-{
-    void *sp = NULL;
-#ifdef __linux__
-    int r;
-    pthread_attr_t attr;
-    r = pthread_getattr_np(pthread_self(), &attr);
-    if (r != 0)
-        panic("pthread_getattr_np() failed (%d)", r);
-    r = pthread_attr_getstack(&attr, &sp, outsize);
-    if (r != 0)
-        panic("pthread_attr_getstack() failed (%d)", r);
-    INFO("__getstack ptr=%p size=0x%lx (sp=%p)", sp, *outsize, &sp);
-    pthread_attr_destroy(&attr);
-#endif
-    if (sp == NULL || *outsize == 0)
-        panic("__getstack() invalid (%p %lu)", sp, *outsize);
-    return sp;
-}
-
 #define	__W_EXITCODE(ret, sig)	((ret) << 8 | (sig))
 
 static int mkwstatus(int is_exit, int status_or_signal)
@@ -464,42 +445,27 @@ static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
     }
 
     for (uintptr_t *p = (uintptr_t *)new_stack; p < (uintptr_t *)(new_stack + stack_size); p++) {
-        if (*p >= old_stack && *p < (old_stack + stack_size))
+        if ((*p >= old_stack) && (*p < (old_stack + stack_size)))
             *p -= diff;
     }
 }
 
-static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, size_t new_stack_size, uintptr_t old_stack, size_t old_stack_size, int entire)
+static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
-    void *a;
-    // INFO("   current stack: %p\n", &a);
-    // INFO("jmpbuf_dupstack: old 0x%lx (%lx) new 0x%lx (%lx)", old_stack, old_stack_size, new_stack, new_stack_size);
+    uintptr_t x;
+
     uintptr_t jmpbuf_old_sp = (uintptr_t) jmpbuf_getstack(jmpbuf);
 
-    if (!(jmpbuf_old_sp >= old_stack && jmpbuf_old_sp < (old_stack + old_stack_size)))
-        panic("jmpbuf_dupstack: jmpbuf's sp not in old_stack");
+    if (!(jmpbuf_old_sp >= old_stack && jmpbuf_old_sp < (old_stack + stack_size)))
+        panic("jmpbuf's sp not in old_stack");
 
-    uintptr_t jmpbuf_depth = old_stack + old_stack_size - jmpbuf_old_sp;
-
-    // INFO("jmpbuf_dupstack:  depth 0x%lx (sp=%lx)", jmpbuf_depth, jmpbuf_old_sp);
-
-    if (entire && jmpbuf_depth > new_stack_size)
-        panic("jmpbuf_dupstack: entire and new_stack_size is smaller than depth (need bigger stack!)");
-    
-    if (jmpbuf_depth > new_stack_size) {
-        uintptr_t diff = jmpbuf_depth - new_stack_size;
-        old_stack_size -= diff;
-        jmpbuf_depth -= diff;
-        // INFO("jmpbuf_dupstack: fixup! diff=0x%lx", diff);
-    }
-    
     memcpy(
-        (void *) (new_stack + new_stack_size - jmpbuf_depth),
-        (void *) jmpbuf_old_sp,
-        jmpbuf_depth
+        (void *) new_stack,
+        (void *) old_stack,
+        stack_size - 0x1000
     );
 
-    jmpbuf_setstack(jmpbuf, new_stack + new_stack_size - jmpbuf_depth, jmpbuf_old_sp, jmpbuf_depth);
+    jmpbuf_setstack(jmpbuf, new_stack, old_stack, stack_size);
 }
 
 #undef PTR_MANGLE
@@ -550,17 +516,10 @@ struct task
     struct list_head tsk_pthreads;  // pthread_entry
 };
 
-struct thread
-{
-    void *thr_stack;
-    size_t thr_stacksize;
-};
-
 static pthread_t main_pthread;
 static struct task *main_task = NULL;
 static pthread_mutex_t tasks_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread struct task *current;
-static __thread struct thread *current_thread;
 
 static void task_lock(struct task *t)
 {
@@ -862,9 +821,6 @@ static void terminate_current_locked(int result)
         pthread_cond_signal(&parent->tsk_wait_cond);
     }
 
-    if (current_thread)
-        free(current_thread);
-
     CALL_FUNC(pthread_exit, 0);
     __builtin_unreachable();
 }
@@ -947,7 +903,7 @@ static const int default_signal_actions[MAX_SIGNALS] = {
 
 void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
-    INFO("signal %d\n", signum);
+    INFO("signum=%d", signum);
     if (!current)
         panic("signal %d on pthread_exit", signum);
     
@@ -991,6 +947,122 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 }
 
 /////////////
+// tvm_pthread_* API
+/////////////
+
+#define TVM_PTHREAD_FORK 1
+
+struct thread_arg
+{
+    int flags;
+    struct task *task;
+    struct pthread_entry *pentry;
+    void *(*start_routine) (void *);
+    void *arg;
+};
+
+static void *thread_entry(void *arg)
+{
+    struct thread_arg targ;
+    memcpy(&targ, arg, sizeof(targ));
+    free(arg);
+
+    current = targ.task;
+
+    task_lock(current);
+
+    if (current->tsk_pid == -1)
+        current->tsk_pid = __gettid();
+
+    ++current->tsk_pthreads_count;
+    targ.pentry->ptl_value = pthread_self();
+    list_add_tail(&targ.pentry->ptl_entry, &current->tsk_pthreads);
+
+    task_unlock(current);
+
+    void *retval = targ.start_routine(targ.arg);
+    pthread_exit(retval);
+}
+
+int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg, int flags)
+{
+    int ret = ENOMEM;
+
+    struct thread_arg *targ = malloc(sizeof(struct thread_arg));
+    if (!targ)
+        goto out;
+
+    targ->pentry = malloc(sizeof(struct pthread_entry));
+    if (!targ->pentry)
+        goto out;
+
+    targ->flags = flags;
+    if (flags & TVM_PTHREAD_FORK)
+    {
+        targ->task = taskalloc();
+        if (!targ->task)
+            goto out;
+    }
+    else
+    {
+        task_lock(current);
+        ++current->tsk_refcount;
+        targ->task = current;
+        task_unlock(current);
+    }
+
+    targ->start_routine = start_routine;
+    targ->arg = arg;
+
+    ret = CALL_FUNC(pthread_create, thread, attr, thread_entry, (void *)targ);
+    
+out:
+    if (0 != ret)
+    {
+        if (targ)
+        {
+            if (flags & TVM_PTHREAD_FORK)
+            {
+                if (targ->task)
+                    taskfreelastref(targ->task, 1);
+            }
+            else
+            {
+                if (targ->task) {
+                    task_lock(current);
+                    --current->tsk_refcount;
+                    task_unlock(current);
+                }
+            }
+
+            if (targ->pentry)
+                free(targ->pentry);
+            free(targ);
+        }
+    }
+
+    return ret;
+}
+
+int tvm_pthread_fork(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
+{ return tvm_pthread_create_ex(thread, attr, start_routine, arg, TVM_PTHREAD_FORK); }
+
+int tvm_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
+{ return tvm_pthread_create_ex(thread, attr, start_routine, arg, 0); }
+
+__attribute__ ((noreturn))
+void tvm_pthread_exit(void *retval)
+{
+    if (pthread_self() == main_pthread)
+        CALL_FUNC(_exit, (int) ((long) retval));
+    
+    // TODO task_release(current, 1);
+    
+    CALL_FUNC(pthread_exit, retval);
+    __builtin_unreachable();
+}
+
+/////////////
 // Forkless API
 /////////////
 
@@ -998,60 +1070,43 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 
 struct forkless_arg {
     jmp_buf jmpbuf;
-    jmp_buf jmpbuf_trampoline;
-    void *parent_stack;
-    size_t parent_stack_size;
-    char tmpstack[0x8000];
+    void **caller_fp;
 };
 
-static void forkless_entry_trampoline(struct forkless_arg *arg)
-{
-    //INFO("forkless_entry_trampoline(%p)", arg);
-    
-    jmpbuf_dupstack(
-        &arg->jmpbuf,
-        (uintptr_t) current_thread->thr_stack,
-        current_thread->thr_stacksize,
-        (uintptr_t) arg->parent_stack,
-        arg->parent_stack_size,
-        1
-    );
-    jmpbuf_mangle(&arg->jmpbuf);
-
-    //INFO("forkless_entry_trampoline longjmp");
-    longjmp(arg->jmpbuf, 1);
-}
+#define FRAME_SIZE 0x1000
 
 static void *forkless_entry(struct forkless_arg *arg)
 {
-    INFO("forkless_entry (%p)", arg);
-    if (0 != setjmp(arg->jmpbuf_trampoline)) {
-        //INFO("forkless_entry setjmp");
-        forkless_entry_trampoline(arg);
-    }
-    
-    jmpbuf_demangle(&arg->jmpbuf_trampoline);
-    jmpbuf_dupstack(
-        &arg->jmpbuf_trampoline,
-        (uintptr_t) arg->tmpstack,
-        sizeof(arg->tmpstack),
-        (uintptr_t) current_thread->thr_stack,
-        current_thread->thr_stacksize,
-        0
-    );
-    jmpbuf_mangle(&arg->jmpbuf_trampoline);
+    void *curr_fp = (void **)__builtin_frame_address(0);
+    char fake_frame[FRAME_SIZE] = {0};
 
-    INFO("forkless_entry longjmp");
-    longjmp(arg->jmpbuf_trampoline, 1);
+    uintptr_t jmpbuf_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf);
+    uintptr_t caller_frame = (uintptr_t)arg->caller_fp;
+    void **new_caller_frame = (void **) (fake_frame + caller_frame - jmpbuf_sp);
+
+    memcpy(fake_frame, (void *)jmpbuf_sp, caller_frame + sizeof(void *) - jmpbuf_sp);
+    *new_caller_frame = curr_fp;
+
+    jmpbuf_setstack(
+        &arg->jmpbuf,
+        (uintptr_t) fake_frame,
+        (uintptr_t) jmpbuf_sp,
+        caller_frame + sizeof(void *) - jmpbuf_sp
+    );
+    jmpbuf_mangle(&arg->jmpbuf);
+
+    longjmp(arg->jmpbuf, 1);
 }
 
-pid_t forkless()
+pid_t fork(void)
 {
-    INFO("forkless");
+    if (!main_task)
+        return CALL_FUNC(fork);
+    
     pid_t pid = -1;
+    void **curr_fp = (void **)__builtin_frame_address(0);
     struct forkless_arg arg = {
-        .parent_stack = current_thread->thr_stack,
-        .parent_stack_size = current_thread->thr_stacksize,
+        .caller_fp = (void **)(*curr_fp)
     };
     pid_t *pidaddr = (pid_t *) (((uintptr_t) &pid) ^ FORKLESS_STACK_MAGIC);
     
@@ -1067,13 +1122,10 @@ pid_t forkless()
     }
     jmpbuf_demangle(&arg.jmpbuf);
 
-    // TODO: make sure `(__builtin_frame_address(0) - getstack(jmpbuf)) < (sizeof(forkless_entry::frame_data) / 2)`
-    // TODO: check parent stack pointer validity
     pthread_t thr;
     tvm_pthread_fork(&thr, NULL, (void *(*)(void *)) forkless_entry, (void *)&arg);
     
     while (pid == -1) {}
-    INFO("forkless end (%d)", pid);
     return pid;
 }
 
@@ -1081,10 +1133,6 @@ pid_t forkless()
 
 void tvm_init()
 {
-    if (NULL == (current_thread = malloc(sizeof(struct thread))))
-        panic("tvm_init thread");
-    current_thread->thr_stack = __getstack(&current_thread->thr_stacksize);
-
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
 
@@ -1123,164 +1171,6 @@ static void __panic(const char *msg, const char *file, int line)
     CALL_FUNC(fprintf, stderr, "\n");
 
     CALL_FUNC(exit, 255);
-}
-
-/////////////
-// tvm_pthread_* API
-/////////////
-
-struct thread_arg
-{
-    int flags;
-    struct task *task;
-    struct pthread_entry *pentry;
-    struct thread *thread;
-    void *(*start_routine) (void *);
-    void *arg;
-};
-
-static void *thread_entry(void *arg)
-{
-    struct thread_arg targ;
-    memcpy(&targ, arg, sizeof(targ));
-    free(arg);
-
-    current = targ.task;
-    current_thread = targ.thread;
-
-    INFO("thread_entry ptr=%p size=0x%lx (sp=%p)", current_thread->thr_stack, current_thread->thr_stacksize, &targ);
-
-    task_lock(current);
-
-    if (current->tsk_pid == -1)
-        current->tsk_pid = __gettid();
-
-    ++current->tsk_pthreads_count;
-    targ.pentry->ptl_value = pthread_self();
-    list_add_tail(&targ.pentry->ptl_entry, &current->tsk_pthreads);
-
-    task_unlock(current);
-
-    void *retval = targ.start_routine(targ.arg);
-    tvm_pthread_exit(retval);
-    __builtin_unreachable();
-}
-
-int tvm_pthread_create_ex(pthread_t *thread, pthread_attr_t *attr, void *(*start_routine) (void *), void *arg, int flags)
-{
-    int ret = ENOMEM;
-    int has_local_attr = 0;
-    pthread_attr_t local_attr;
-    int has_local_stack = 0;
-
-    struct thread_arg *targ = malloc(sizeof(struct thread_arg));
-    if (!targ)
-        goto out;
-
-    targ->pentry = malloc(sizeof(struct pthread_entry));
-    if (!targ->pentry)
-        goto out;
-
-    targ->flags = flags;
-    if (flags & TVM_PTHREAD_FORK)
-    {
-        targ->task = taskalloc();
-        if (!targ->task)
-            goto out;
-    }
-    else
-    {
-        task_lock(current);
-        ++current->tsk_refcount;
-        targ->task = current;
-        task_unlock(current);
-    }
-
-    targ->thread = malloc(sizeof(struct thread));
-    if (!targ->thread)
-        goto out;
-    memset(targ->thread, 0, sizeof(struct thread));
-
-    if (NULL == attr) {
-        has_local_attr = 1;
-        attr = &local_attr;
-        pthread_attr_init(attr);
-    }
-
-    pthread_attr_getstack(attr, &targ->thread->thr_stack, &targ->thread->thr_stacksize);
-
-    if (!targ->thread->thr_stacksize) {
-        targ->thread->thr_stacksize = current_thread->thr_stacksize;
-        pthread_attr_setstacksize(attr, targ->thread->thr_stacksize);
-    }
-
-    if (!targ->thread->thr_stack) {
-        has_local_stack = 1;
-        targ->thread->thr_stack = malloc(targ->thread->thr_stacksize);
-        if (!targ->thread->thr_stack)
-            goto out;
-        pthread_attr_setstack(attr, targ->thread->thr_stack, targ->thread->thr_stacksize);
-    }
-
-    targ->start_routine = start_routine;
-    targ->arg = arg;
-
-    ret = CALL_FUNC(pthread_create, thread, attr, thread_entry, (void *)targ);
-    
-out:
-    if (0 != ret)
-    {
-        if (targ)
-        {
-            if (targ->thread) {
-                if (has_local_stack && targ->thread->thr_stack)
-                    free(targ->thread->thr_stack);
-                free(targ->thread);
-            }
-            
-            if (flags & TVM_PTHREAD_FORK)
-            {
-                if (targ->task)
-                    taskfreelastref(targ->task, 1);
-            }
-            else
-            {
-                if (targ->task) {
-                    task_lock(current);
-                    --current->tsk_refcount;
-                    task_unlock(current);
-                }
-            }
-
-            if (targ->pentry)
-                free(targ->pentry);
-            free(targ);
-        }
-    }
-
-    if (has_local_attr) {
-        pthread_attr_destroy(attr);
-    }
-
-    return ret;
-}
-
-int tvm_pthread_fork(pthread_t *thread, pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
-{ return tvm_pthread_create_ex(thread, attr, start_routine, arg, TVM_PTHREAD_FORK); }
-
-int tvm_pthread_create(pthread_t *thread, pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
-{ return tvm_pthread_create_ex(thread, attr, start_routine, arg, 0); }
-
-__attribute__ ((noreturn))
-void tvm_pthread_exit(void *retval)
-{
-    if (pthread_self() == main_pthread)
-        CALL_FUNC(_exit, (int) ((long) retval));
-    
-    // TODO task_release(current, 1);
-    
-    CALL_FUNC(pthread_exit, retval);
-    __builtin_unreachable();
 }
 
 /////////////
@@ -1864,7 +1754,7 @@ int ioctl(int fd, unsigned long request, ...)
 }
 
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
-    return tvm_pthread_create(thread, (pthread_attr_t *)attr, start_routine, arg);
+    return tvm_pthread_create(thread, attr, start_routine, arg);
 }
 
 void pthread_exit(void *retval) { tvm_pthread_exit(retval); }
@@ -1910,14 +1800,6 @@ pid_t getppid()
     task_unlock(current);
 
     return ppid;
-}
-
-pid_t fork(void)
-{
-    if (!main_task)
-        return CALL_FUNC(fork);
-    
-    return forkless();
 }
 
 pid_t wait(int *wstatus)

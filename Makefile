@@ -11,7 +11,7 @@ forkless: dropbear #mksh
 	gcc -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -lz -lpthread -lutil -pie
 
 test:
-	gcc -fno-stack-protector -I. tvm.c test_tvm.c -o test_forkless -lpthread -pie
+	gcc -I. tvm.c test_tvm.c -o test_forkless -lpthread -pie
 
 mksh:
 	@if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && sh ./Build.sh; fi
