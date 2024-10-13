@@ -33,14 +33,9 @@
  * 4. syscalls: posix_fadvise, posix_fallocate, posix_openpt, grantpt, ptsname, unlockpt
  */
 
-#define LOCAL_SYM(Name) o_##Name
-#define DECL_FUNC(Name) static typeof(Name) *LOCAL_SYM(Name) = NULL;
-#define CALL_FUNC(Name, ...) (LOCAL_SYM(Name) (__VA_ARGS__))
-
 #define panic(Msg, ...) do { char __MSG[0x1000] = {0}; snprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)
 static void __panic(const char *m, const char *f, int l);
 
-#define FIND_FUNC(Name) do { LOCAL_SYM(Name) = (typeof(Name) *)dlsym(RTLD_NEXT, #Name ); if (!(LOCAL_SYM(Name))) { panic("FIND_FUNC " #Name); } } while (0)
 
 #ifdef __O_TMPFILE
 #define __OPEN_NEEDS_MODE(oflag) \
@@ -59,8 +54,102 @@ static void __panic(const char *m, const char *f, int l);
 #define INFO(Msg, ...) do { CALL_FUNC(printf, "Kernel(%d): %s: " Msg "\n", __gettid(), __FUNCTION__, ##__VA_ARGS__); } while (0)
 
 /////////////
+// List
+/////////////
+
+#define LIST_POISON1  ((void *) 0x100)
+#define LIST_POISON2  ((void *) 0x122)
+
+#define LIST_HEAD_INIT(name) { &(name), &(name) }
+
+#define LIST_HEAD(name) \
+	struct list_head name = LIST_HEAD_INIT(name)
+
+struct list_head {
+    struct list_head *next, *prev;
+};
+
+static inline void INIT_LIST_HEAD(struct list_head *list)
+{
+	WRITE_ONCE(list->next, list);
+	WRITE_ONCE(list->prev, list);
+}
+
+static inline void __list_add(struct list_head *new,
+			      struct list_head *prev,
+			      struct list_head *next)
+{
+	next->prev = new;
+	new->next = next;
+	new->prev = prev;
+	WRITE_ONCE(prev->next, new);
+}
+
+static inline void list_add(struct list_head *new, struct list_head *head)
+{
+	__list_add(new, head, head->next);
+}
+
+static inline void list_add_tail(struct list_head *new, struct list_head *head)
+{
+	__list_add(new, head->prev, head);
+}
+
+static inline void list_del(struct list_head *entry)
+{
+    entry->next->prev = entry->prev;
+	WRITE_ONCE(entry->prev->next, entry->next);
+    
+	entry->next = LIST_POISON1;
+	entry->prev = LIST_POISON2;
+}
+
+static inline int list_empty(const struct list_head *head)
+{
+	return READ_ONCE(head->next) == head;
+}
+
+#define list_entry(ptr, type, member) \
+	container_of(ptr, type, member)
+
+#define list_first_entry(ptr, type, member) \
+	list_entry((ptr)->next, type, member)
+
+#define list_next_entry(pos, member) \
+	list_entry((pos)->member.next, typeof(*(pos)), member)
+
+static inline int list_is_head(const struct list_head *list, const struct list_head *head)
+{
+	return list == head;
+}
+
+#define list_entry_is_head(pos, head, member)				\
+	list_is_head(&pos->member, (head))
+
+#define list_for_each_entry(pos, head, member)				\
+	for (pos = list_first_entry(head, typeof(*pos), member);	\
+	     !list_entry_is_head(pos, head, member);			\
+	     pos = list_next_entry(pos, member))
+
+/////////////
 // Functions
 /////////////
+
+#define LOCAL_SYM(Name) o_##Name
+#define DECL_FUNC(Name) \
+    static typeof(Name) *LOCAL_SYM(Name) = NULL; \
+    static struct original_func_t _of_ ## Name = { .ptrdest = (void *)&LOCAL_SYM(Name), .name = #Name }; \
+    __attribute__((constructor)) \
+    static void _ofc_ ## Name () { list_add_tail( & (_of_ ## Name).list, &original_functions); }
+#define CALL_FUNC(Name, ...) (LOCAL_SYM(Name) (__VA_ARGS__))
+
+struct original_func_t {
+    struct list_head list;
+    void **ptrdest;
+    const char *name;
+};
+
+static LIST_HEAD(original_functions);
 
 DECL_FUNC(fdopen);
 DECL_FUNC(fwrite);
@@ -176,190 +265,13 @@ DECL_FUNC(kill);
 __attribute__((constructor))
 static void init_funcs()
 {
-    FIND_FUNC(fdopen);
-    FIND_FUNC(fwrite);
-    FIND_FUNC(fread);
-    FIND_FUNC(fclose);
-    FIND_FUNC(fseek);
-    FIND_FUNC(ftell);
-    FIND_FUNC(fflush);
-    FIND_FUNC(setbuf);
-    FIND_FUNC(setbuffer);
-    FIND_FUNC(setlinebuf);
-    FIND_FUNC(setvbuf);
-    FIND_FUNC(fputc);
-    FIND_FUNC(fputs);
-    FIND_FUNC(putc);
-    FIND_FUNC(putchar);
-    FIND_FUNC(puts);
-    FIND_FUNC(fgetc);
-    FIND_FUNC(fgets);
-    FIND_FUNC(getc);
-    FIND_FUNC(getchar);
-    FIND_FUNC(ungetc);
-    FIND_FUNC(clearerr);
-    FIND_FUNC(feof);
-    FIND_FUNC(ferror);
-    FIND_FUNC(fileno);
-
-    FIND_FUNC(printf);
-    FIND_FUNC(fprintf);
-    FIND_FUNC(dprintf);
-    FIND_FUNC(vprintf);
-    FIND_FUNC(vfprintf);
-    FIND_FUNC(vdprintf);
-    FIND_FUNC(scanf);
-    FIND_FUNC(fscanf);
-    FIND_FUNC(vscanf);
-    FIND_FUNC(vfscanf);
-    FIND_FUNC(perror);
-
-    FIND_FUNC(open);
-    FIND_FUNC(creat);
-    FIND_FUNC(openat);
-    FIND_FUNC(read);
-    FIND_FUNC(write);
-    FIND_FUNC(close);
-    FIND_FUNC(readv);
-    FIND_FUNC(writev);
-    FIND_FUNC(lseek);
-    FIND_FUNC(fsync);
-    FIND_FUNC(dup);
-    FIND_FUNC(dup2);
-    FIND_FUNC(pipe);
-    FIND_FUNC(select);
-    FIND_FUNC(poll);
-    FIND_FUNC(fcntl);
-    FIND_FUNC(ftruncate);
-    FIND_FUNC(fstat);
-    FIND_FUNC(fstatat);
-    FIND_FUNC(faccessat);
-    FIND_FUNC(fchmod);
-    FIND_FUNC(fchmodat);
-    FIND_FUNC(fchown);
-    FIND_FUNC(fchownat);
-    FIND_FUNC(flock);
-    FIND_FUNC(lockf);
-    FIND_FUNC(readlinkat);
-    FIND_FUNC(symlinkat);
-    FIND_FUNC(linkat);
-    FIND_FUNC(renameat);
-    FIND_FUNC(unlinkat);
-    FIND_FUNC(mknodat);
-    FIND_FUNC(mkdirat);
-
-    FIND_FUNC(socket);
-    FIND_FUNC(accept);
-    FIND_FUNC(bind);
-    FIND_FUNC(listen);
-    FIND_FUNC(connect);
-    FIND_FUNC(getpeername);
-    FIND_FUNC(getsockname);
-    FIND_FUNC(getsockopt);
-    FIND_FUNC(setsockopt);
-    FIND_FUNC(send);
-    FIND_FUNC(sendto);
-    FIND_FUNC(sendmsg);
-    FIND_FUNC(recv);
-    FIND_FUNC(recvfrom);
-    FIND_FUNC(recvmsg);
-    FIND_FUNC(shutdown);
-    FIND_FUNC(socketpair);
-    FIND_FUNC(ioctl);
-
-    FIND_FUNC(pthread_create);
-    FIND_FUNC(pthread_exit);
-
-    FIND_FUNC(exit);
-    FIND_FUNC(_exit);
-    FIND_FUNC(_Exit);
-    FIND_FUNC(abort);
-
-    FIND_FUNC(getpid);
-    FIND_FUNC(getppid);
-
-    FIND_FUNC(fork);
-    FIND_FUNC(wait);
-    FIND_FUNC(waitpid);
-
-    FIND_FUNC(signal);
-    FIND_FUNC(sigaction);
-    FIND_FUNC(raise);
-    FIND_FUNC(kill);
+    struct original_func_t *curr_func;
+    list_for_each_entry(curr_func, &original_functions, list) {
+        *curr_func->ptrdest = dlsym(RTLD_NEXT, curr_func->name );
+        if (NULL == *curr_func->ptrdest)
+            panic("function '%s' not found", curr_func->name);
+    }
 };
-
-/////////////
-// List
-/////////////
-
-#define LIST_POISON1  ((void *) 0x100)
-#define LIST_POISON2  ((void *) 0x122)
-
-struct list_head {
-    struct list_head *next, *prev;
-};
-
-static inline void INIT_LIST_HEAD(struct list_head *list)
-{
-	WRITE_ONCE(list->next, list);
-	WRITE_ONCE(list->prev, list);
-}
-
-static inline void __list_add(struct list_head *new,
-			      struct list_head *prev,
-			      struct list_head *next)
-{
-	next->prev = new;
-	new->next = next;
-	new->prev = prev;
-	WRITE_ONCE(prev->next, new);
-}
-
-static inline void list_add(struct list_head *new, struct list_head *head)
-{
-	__list_add(new, head, head->next);
-}
-
-static inline void list_add_tail(struct list_head *new, struct list_head *head)
-{
-	__list_add(new, head->prev, head);
-}
-
-static inline void list_del(struct list_head *entry)
-{
-    entry->next->prev = entry->prev;
-	WRITE_ONCE(entry->prev->next, entry->next);
-    
-	entry->next = LIST_POISON1;
-	entry->prev = LIST_POISON2;
-}
-
-static inline int list_empty(const struct list_head *head)
-{
-	return READ_ONCE(head->next) == head;
-}
-
-#define list_entry(ptr, type, member) \
-	container_of(ptr, type, member)
-
-#define list_first_entry(ptr, type, member) \
-	list_entry((ptr)->next, type, member)
-
-#define list_next_entry(pos, member) \
-	list_entry((pos)->member.next, typeof(*(pos)), member)
-
-static inline int list_is_head(const struct list_head *list, const struct list_head *head)
-{
-	return list == head;
-}
-
-#define list_entry_is_head(pos, head, member)				\
-	list_is_head(&pos->member, (head))
-
-#define list_for_each_entry(pos, head, member)				\
-	for (pos = list_first_entry(head, typeof(*pos), member);	\
-	     !list_entry_is_head(pos, head, member);			\
-	     pos = list_next_entry(pos, member))
 
 /////////////
 // Helpers
