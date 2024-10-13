@@ -171,6 +171,117 @@ TEST(ProcParent) {
     ASSERT_EQ(pzz_2, 1);
 }
 
+TEST(ProcSid) {
+    ASSERT_EQ(getpid(), getsid(0));
+    ASSERT_EQ(-1, setsid());
+    ASSERT_EQ(EPERM, errno);
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (getppid() != getsid(0)) {
+            fprintf(stderr, "bad sid\n");
+            exit(1);
+        }
+        usleep(100000);
+        if (getpid() != setsid() || getpid() != getsid(0)) {
+            perror("child: setsid");
+            exit(2);
+        }
+
+        exit(0);
+    }
+
+    ASSERT_EQ(getpid(), getsid(p));
+
+    usleep(200000);
+    ASSERT_EQ(p, getsid(p));
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(ProcPgid) {
+    ASSERT_EQ(getpid(), getpgrp());
+    ASSERT_EQ(-1, setpgrp());
+    ASSERT_EQ(EPERM, errno);
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (getppid() != getpgrp()) {
+            fprintf(stderr, "bad pgid\n");
+            exit(1);
+        }
+
+        usleep(100000);
+
+        if (0 != setpgrp() || getpid() != getpgrp()) {
+            perror("child: setpgid");
+            exit(2);
+        }
+
+        exit(0);
+    }
+
+    ASSERT_EQ(getpid(), getpgid(p));
+
+    usleep(200000);
+
+    ASSERT_EQ(getpid(), getsid(p));
+    ASSERT_EQ(p, getpgid(p));
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(ProcPgidSet) {
+    pid_t p1 = fork();
+    ASSERT_NEQ(p1, -1);
+    if (!p1) {
+        usleep(100000);
+        
+        if (getpid() != getpgrp()) {
+            fprintf(stderr, "p1 pgrp\n");
+            exit(1);
+        }
+        
+        exit(0);
+    }
+
+    pid_t p2 = fork();
+    ASSERT_NEQ(p2, -1);
+    if (!p2) {
+        usleep(100000);
+        
+        if (p1 != getpgrp()) {
+            fprintf(stderr, "p2 pgrp\n");
+            exit(1);
+        }
+
+        exit(0);
+    }
+
+    ASSERT_EQ(0, setpgid(p1, 0));
+    ASSERT_EQ(p1, getpgid(p1));
+    ASSERT_EQ(0, setpgid(p2, p1));
+    ASSERT_EQ(p1, getpgid(p2));
+
+    int s;
+    ASSERT_EQ(p1, waitpid(p1, &s, 0));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+
+    ASSERT_EQ(p2, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
 
 static __thread int sigged = 0;
 void my_handler(int signo, siginfo_t *si, void * ctx) {
@@ -436,6 +547,11 @@ static int runtest(struct testinfo_t *testinfo)
         dup2(errp[1], 2);
         close(outp[1]);
         close(errp[1]);
+
+        if (getpid() != setsid()) {
+            perror("test_tvm: set sid");
+            exit(1);
+        }
 
         tvm_init();
         testinfo->f();

@@ -257,6 +257,13 @@ DECL_FUNC(fork);
 DECL_FUNC(wait);
 DECL_FUNC(waitpid);
 
+DECL_FUNC(setsid);
+DECL_FUNC(getsid);
+DECL_FUNC(setpgid);
+DECL_FUNC(getpgid);
+DECL_FUNC(getpgrp);
+DECL_FUNC(setpgrp);
+
 DECL_FUNC(signal);
 DECL_FUNC(sigaction);
 DECL_FUNC(raise);
@@ -426,6 +433,8 @@ struct task
     struct sigaction tsk_sighandlers[MAX_SIGNALS];
     unsigned tsk_pthreads_count;
     struct list_head tsk_pthreads;  // pthread_entry
+    pid_t tsk_sid;
+    pid_t tsk_pgid;
 };
 
 static pthread_t main_pthread;
@@ -482,6 +491,11 @@ static struct task *taskalloc()
         t->tsk_f[1] = stdout;
         t->tsk_f[2] = stderr;
 
+        if (-1 == (t->tsk_sid = CALL_FUNC(getsid, 0)))
+            panic("getsid");
+        if (-1 == (t->tsk_pgid = CALL_FUNC(getpgid, 0)))
+            panic("getpgid");
+
         struct pthread_entry *pent = make_pthread_entry(pthread_self());
         if (!pent)
             panic("taskalloc make_pthread_entry");
@@ -492,6 +506,9 @@ static struct task *taskalloc()
         task_lock(current);
         t->tsk_parent = current;
         t->tsk_pid = -1;
+        t->tsk_sid = current->tsk_sid;
+        t->tsk_pgid = current->tsk_pgid;
+
         for (int i = 0; i < MAX_FILES; i++) {
             if (t->tsk_parent->tsk_fd[i] == -1)
                 continue;
@@ -1493,8 +1510,7 @@ int fcntl(int fd, int cmd, ... /* arg */ )
         }
         return f;
     }
-
-    return fcntl(t_fd(fd), cmd, arg);
+    return CALL_FUNC(fcntl, t_fd(fd), cmd, arg);
 }
 
 int ftruncate(int fd, off_t length)
@@ -1749,6 +1765,125 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
     taskdealloc(zombiet);
 
     return childpid;
+}
+
+pid_t setsid(void) {
+    if (!main_task)
+        return CALL_FUNC(setsid);
+    
+    if (-1 == setpgid(0, 0))
+        return -1;
+    
+    task_lock(current);
+    current->tsk_sid = current->tsk_pid;
+    task_unlock(current);
+
+    return current->tsk_sid;
+}
+
+pid_t getsid(pid_t pid)
+{
+    if (!main_task)
+        return CALL_FUNC(getsid, pid);
+    
+    if (!pid)
+        pid = current->tsk_pid;
+    
+    struct task *t = task_for_pid(pid);
+    if (!t)
+        return CALL_FUNC(getsid, pid);
+    
+    return t->tsk_sid;
+}
+
+int setpgid(pid_t pid, pid_t pgid)
+{
+    if (!main_task)
+        return CALL_FUNC(setpgid, pid, pgid);
+    
+    if (pgid < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!pid)
+        pid = current->tsk_pid;
+    
+    struct task *t = task_for_pid(pid);
+    if (!t)
+        return CALL_FUNC(setpgid, pid, pgid);
+
+    if (!pgid)
+        pgid = pid;
+
+    task_lock(t);
+
+    if (t->tsk_pid == t->tsk_sid) {
+        task_unlock(t);
+        errno = EPERM;
+        return -1;
+    }
+
+    pthread_mutex_lock(&tasks_lock);
+    struct task *ct;
+    list_for_each_entry(ct, &main_task->tsk_list, tsk_list)
+    {
+        if (pgid == ct->tsk_pgid)
+        {
+            if (pid == ct->tsk_pid || t->tsk_sid != ct->tsk_sid) {
+                errno = EPERM;
+                pthread_mutex_unlock(&tasks_lock);
+                task_unlock(t);
+                return -1;
+            }
+
+            pthread_mutex_unlock(&tasks_lock);
+            task_unlock(t);
+            t->tsk_pgid = ct->tsk_pgid;
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&tasks_lock);
+
+    if (pid != pgid) {
+        errno = ESRCH;
+        task_unlock(t);
+        return -1;
+    }
+
+    t->tsk_pgid = pgid;
+    task_unlock(t);
+    return 0;
+}
+
+pid_t getpgid(pid_t pid)
+{
+    if (!main_task)
+        return CALL_FUNC(getpgid, pid);
+    
+    if (!pid)
+        pid = current->tsk_pid;
+    
+    struct task *t = task_for_pid(pid);
+    if (!t)
+        return CALL_FUNC(getpgid, pid);
+    
+    return t->tsk_pgid;
+}
+
+pid_t getpgrp(void)
+{
+    if (!main_task)
+        return CALL_FUNC(getpgrp);
+    
+    return getpgid(0);
+}
+
+int setpgrp(void)
+{
+    if (!main_task)
+        return CALL_FUNC(setpgrp);
+    
+    return setpgid(0, 0);
 }
 
 sighandler_t signal(int signum, sighandler_t handler)
