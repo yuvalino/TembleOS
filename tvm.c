@@ -876,6 +876,82 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 }
 
 /////////////
+// Copy-On-Write (COW)
+/////////////
+
+struct cow_variable_t {
+    struct list_head list;
+    void *(*getptr_fn)();
+    size_t size;
+};
+static LIST_HEAD(cow_variables);
+
+void _tvm_register_cow(void *(*getptr_fn)(), size_t size)
+{
+    struct cow_variable_t *cowvar;
+    if (NULL == (cowvar = malloc(sizeof(*cowvar))))
+        panic("cowvar");
+    
+    list_add_tail(&cowvar->list, &cow_variables);
+    cowvar->getptr_fn = getptr_fn;
+    cowvar->size = size; 
+}
+
+static int cow_get_thread_ptrs(void ***out_data)
+{
+    size_t cows = 0;
+    struct cow_variable_t *cow;
+
+    list_for_each_entry(cow, &cow_variables, list)
+        cows++;
+    
+    void **data = malloc((cows+1)*sizeof(void *));
+    if (!data)
+        return 1;
+    memset(data, 0, (cows+1)*sizeof(void *));
+    
+    int i = 0;
+    list_for_each_entry(cow, &cow_variables, list) {
+        if (i >= (cows)) {
+            free(data);
+            return 2;
+        }
+        data[i] = cow->getptr_fn();
+        if (data[i++] == NULL) {
+            free(data);
+            return 3;
+        }
+    }
+
+    if (i != (cows)) {
+        free(data);
+        return 4;
+    }
+
+    *out_data = data;
+    return 0;
+}
+
+static int cow_set_thread_ptrs(void **data)
+{
+    struct cow_variable_t *cow;
+    
+    list_for_each_entry(cow, &cow_variables, list) {
+        if (*data == NULL) {
+            return 1;
+        }
+
+        memcpy(cow->getptr_fn(), *data, cow->size);
+        data++;
+    }
+
+    if (*data != NULL)
+        return 2;
+    
+    return 0;
+}
+
+/////////////
 // tvm_pthread_* API
 /////////////
 
@@ -888,15 +964,13 @@ struct thread_arg
     struct pthread_entry *pentry;
     void *(*start_routine) (void *);
     void *arg;
+    int wake; // condvar for child<->parent
+    void **cow_data;
 };
 
-static void *thread_entry(void *arg)
+static void *thread_entry(struct thread_arg *arg)
 {
-    struct thread_arg targ;
-    memcpy(&targ, arg, sizeof(targ));
-    free(arg);
-
-    current = targ.task;
+    current = arg->task;
 
     task_lock(current);
 
@@ -904,12 +978,20 @@ static void *thread_entry(void *arg)
         current->tsk_pid = __gettid();
 
     ++current->tsk_pthreads_count;
-    targ.pentry->ptl_value = pthread_self();
-    list_add_tail(&targ.pentry->ptl_entry, &current->tsk_pthreads);
+    arg->pentry->ptl_value = pthread_self();
+    list_add_tail(&arg->pentry->ptl_entry, &current->tsk_pthreads);
 
     task_unlock(current);
 
-    void *retval = targ.start_routine(targ.arg);
+    if (0 != cow_set_thread_ptrs(arg->cow_data))
+        panic("cow_set_thread_ptrs");
+
+    void *(*start_routine)(void *) = arg->start_routine;
+    void *routine_arg = arg->arg;
+    
+    arg->wake = 1;
+
+    void *retval = start_routine(routine_arg);
     pthread_exit(retval);
 }
 
@@ -931,6 +1013,10 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
         targ->task = taskalloc();
         if (!targ->task)
             goto out;
+        
+        if (0 != cow_get_thread_ptrs(&targ->cow_data)) {
+            goto out;
+        }
     }
     else
     {
@@ -938,13 +1024,24 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
         ++current->tsk_refcount;
         targ->task = current;
         task_unlock(current);
+        
+        targ->cow_data = NULL;
     }
 
     targ->start_routine = start_routine;
     targ->arg = arg;
+    targ->wake = 0;
 
-    ret = CALL_FUNC(pthread_create, thread, attr, thread_entry, (void *)targ);
-    
+    ret = CALL_FUNC(pthread_create, thread, attr, (void *(*)(void *))thread_entry, (void *)targ);
+
+    if (0 == ret) {
+        while (0 == targ->wake) { }
+    }
+
+    if (targ->cow_data)
+        free(targ->cow_data);
+    free(targ);
+
 out:
     if (0 != ret)
     {

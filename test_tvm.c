@@ -478,6 +478,39 @@ TEST(FDsFcntl) {
     ASSERT_EQ(nf2, 11);
 }
 
+static COW_IMPL(int, cow_int);
+
+TEST(COWSingleThreaded) {
+    cow_int = 69;
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (cow_int != 69)
+            _exit(1);
+        cow_int = 5;
+        usleep(200000);
+        if (cow_int != 5)
+            _exit(2);
+        _exit(0);
+    }
+
+    usleep(100000);
+
+    ASSERT_EQ(cow_int, 69);
+    cow_int = 420;
+
+    usleep(200000);
+
+    ASSERT_EQ(cow_int, 420);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 //////////
 //// Framework
 //////////
