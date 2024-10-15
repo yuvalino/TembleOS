@@ -12,3 +12,7 @@ void tvm_init();
 
 #define tvm_environ (*(_tvm_environ()))
 char ***_tvm_environ();
+
+typedef int (*main_func_t)(int, char * const*, char * const*);
+void tvm_register_program(const char *pathname, main_func_t main_routine);
+

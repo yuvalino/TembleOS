@@ -599,6 +599,63 @@ TEST(EnvNULL) {
     ASSERT_NEQ(tvm_environ, NULL);
 }
 
+static int my_basic_prog()
+{
+    return 69;
+}
+
+TEST(ExecBasic) {
+    ASSERT_EQ(-1, execl("/aaa", "/aaa", NULL));
+    ASSERT_EQ(ENOENT, errno);
+
+    tvm_register_program("/basic_prog", (main_func_t)my_basic_prog);
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        execl("/basic_prog", "/basic_prog", NULL);
+        _exit(1);
+    }
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 69);
+}
+
+static int my_args_prog(int argc, char **argv)
+{
+    if (argc != 2)
+        return 2;
+    
+    if (0 != strcmp(argv[0], "arg0"))
+        return 3;
+
+    if (0 != strcmp(argv[1], "arg1"))
+        return 4;
+    
+    if (NULL != argv[2])
+        return 5;
+    
+    return 0;
+}
+
+TEST(ExecArgs) {
+    tvm_register_program("/args_prog", (main_func_t)my_args_prog);
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        execl("/args_prog", "arg0", "arg1", NULL);
+        _exit(1);
+    }
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 //////////
 //// Framework
 //////////

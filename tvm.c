@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <limits.h>
 
 #include "tvm.h"
 
@@ -274,6 +275,14 @@ DECL_FUNC(putenv);
 DECL_FUNC(setenv);
 DECL_FUNC(unsetenv);
 DECL_FUNC(clearenv);
+
+DECL_FUNC(execve);
+DECL_FUNC(execl);
+DECL_FUNC(execlp);
+DECL_FUNC(execle);
+DECL_FUNC(execv);
+DECL_FUNC(execvp);
+DECL_FUNC(execvpe);
 
 __attribute__((constructor))
 static void init_funcs()
@@ -1059,6 +1068,77 @@ static int cow_set_thread_ptrs(void **data)
 }
 
 /////////////
+// Exec
+/////////////
+
+typedef int (*main_func_t)(int, char * const*, char * const*);
+struct exec_program {
+    struct list_head list;
+    const char *file;
+    const char *pathname;
+    main_func_t main_routine;
+};
+static LIST_HEAD(exec_programs);
+static pthread_mutex_t programs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void tvm_register_program(const char *pathname, main_func_t main_routine)
+{
+    if (!pathname || !pathname[0])
+        panic("pathname");
+    
+    struct exec_program *prog;
+    if (NULL == (prog = malloc(sizeof(*prog))))
+        panic("prog");
+    
+    prog->pathname = pathname;
+    prog->main_routine = main_routine;
+    prog->file = strchr(pathname, '/');
+    if (prog->file)
+        prog->file++;
+    else
+        prog->file = prog->pathname;
+    
+    if (!prog->file[0])
+        panic("program file \"%s\"", prog->pathname);
+    
+    pthread_mutex_lock(&programs_lock);
+    list_add_tail(&prog->list, &exec_programs);
+    pthread_mutex_unlock(&programs_lock);
+}
+
+static main_func_t find_program(const char *pathname)
+{
+    pthread_mutex_lock(&programs_lock);
+    struct exec_program *prog;
+    list_for_each_entry(prog, &exec_programs, list) {
+        if (0 == strcmp(pathname, prog->pathname)) {
+            main_func_t f = prog->main_routine;
+            pthread_mutex_unlock(&programs_lock);
+            return f;
+        }
+    }
+    pthread_mutex_unlock(&programs_lock);
+
+    return NULL;
+}
+
+static const char *find_program_pathname(const char *file)
+{
+    pthread_mutex_lock(&programs_lock);
+    struct exec_program *prog;
+    list_for_each_entry(prog, &exec_programs, list) {
+        if (0 == strcmp(file, prog->file)) {
+            const char *p = prog->pathname;
+            pthread_mutex_unlock(&programs_lock);
+            return p;
+        }
+    }
+    pthread_mutex_unlock(&programs_lock);
+
+    return NULL;
+}
+
+/////////////
 // tvm_pthread_* API
 /////////////
 
@@ -1539,10 +1619,14 @@ ssize_t write(int fd, const void *buf, size_t count)
 
 int close(int fd)
 {
+    if (!main_task)
+        return CALL_FUNC(close, fd);
+    
+    task_lock(current);
     int r = CALL_FUNC(close, t_fd(fd));
-    if (main_task && r == 0) {
+    if (r == 0)
         current->tsk_fd[fd] = -1;
-    }
+    task_unlock(current);
     return r;
 }
 
@@ -1625,7 +1709,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struc
         if (!currfd.events)
             continue;
         
-        fds = realloc(fds, fdcount+1);
+        fds = realloc(fds, sizeof(*fds) * (fdcount+1));
         if (!fds) {
             errno = ENOMEM;
             return -1;
@@ -2332,4 +2416,189 @@ int clearenv(void)
     task_unlock(current);
 
     return 0;
+}
+
+int execve(const char *pathname, char *const argv[], char *const envp[])
+{
+    if (!main_task)
+        return CALL_FUNC(execve, pathname, argv, envp);
+
+    INFO("execve(\"%s\")", pathname);
+
+    int argc = 0;
+    for (char * const*a = argv; *a && argc < INT_MAX; a++)
+        argc++;
+    
+    if (argc == INT_MAX) {
+        INFO("  failed(E2BIG)");
+        errno = E2BIG;
+        return -1;
+    }
+
+    main_func_t main_func = find_program(pathname);
+    if (!main_func) {
+        INFO("  failed(ENOENT)");
+        errno = ENOENT;
+        return -1;
+    }
+
+    // No failing from here!
+
+    for (int i = 0; i < MAX_FILES; i++) {
+        
+        task_lock(current);
+        if (current->tsk_fd[i] == -1) {
+            task_unlock(current);
+            continue;
+        }
+        task_unlock(current);
+
+        int fd_flags = fcntl(i, F_GETFD);
+        if (-1 == fd_flags)
+            panic("execve(\"%s\") fcntl(%d, F_GETFD)", pathname, i);
+        if (fd_flags & FD_CLOEXEC) {
+            if (0 != close(i))
+                panic("execve(\"%s\") close(%d)", pathname, i);
+        }
+    }
+
+    struct sigaction act = { .sa_handler = SIG_DFL };
+    for (int i = 1; i < MAX_SIGNALS; i++) {
+        if (i == SIGKILL || i == SIGSTOP)
+            continue;
+        if (0 != sigaction(i, &act, NULL))
+            panic("sigaction(%d)", i);
+    }
+    
+    // TODO if 0, 1, 2 we can be nice and open /dev/full, /dev/null and /dev/null for the program
+
+    exit(main_func(argc, argv, envp));
+}
+
+int execl(const char *pathname, const char *arg, ... /*, (char *) NULL */)
+{
+    size_t argc;
+    va_list ap;
+    
+    va_start(ap, arg);
+    for (argc = 1; va_arg(ap, const char *) && argc < INT_MAX;)
+        argc++;
+    va_end(ap);
+
+    if (argc == INT_MAX) {
+        errno = E2BIG;
+        return -1;
+    }
+
+    char **argv = malloc(sizeof(char *) * (argc+1));
+    if (!argv) {
+        errno = ENOMEM;
+        return -1;
+    }
+    argv[argc] = NULL;
+    
+    va_start(ap, arg);
+    argv[0] = (char *)arg;
+    for (char **a = (argv+1); a < (argv + argc); a++)
+        *a = va_arg(ap, char *);
+    va_end(ap);
+
+    int r = execv(pathname, argv);
+    free(argv);
+    return r;
+}
+
+int execlp(const char *file, const char *arg, ... /*, (char *) NULL */)
+{
+    size_t argc;
+    va_list ap;
+    
+    va_start(ap, arg);
+    for (argc = 0; va_arg(ap, const char *) && argc < INT_MAX;)
+        argc++;
+    va_end(ap);
+
+    if (argc == INT_MAX) {
+        errno = E2BIG;
+        return -1;
+    }
+
+    char **argv = malloc(sizeof(char *) * (argc+1));
+    if (!argv) {
+        errno = ENOMEM;
+        return -1;
+    }
+    argv[argc] = NULL;
+
+    va_start(ap, arg);
+    for (char **a = argv; a < (argv + argc); a++)
+        *a = va_arg(ap, char *);
+    va_end(ap);
+
+    int r = execvp(file, argv);
+    free(argv);
+    return r;
+}
+
+int execle(const char *pathname, const char *arg, ... /*, (char *) NULL, char *const envp[] */)
+{
+    size_t argc;
+    va_list ap;
+    
+    va_start(ap, arg);
+    for (argc = 0; va_arg(ap, const char *) && argc < INT_MAX;)
+        argc++;
+    va_end(ap);
+
+    if (argc == INT_MAX) {
+        errno = E2BIG;
+        return -1;
+    }
+
+    char **argv = malloc(sizeof(char *) * (argc+1));
+    if (!argv) {
+        errno = ENOMEM;
+        return -1;
+    }
+    argv[argc] = NULL;
+
+    va_start(ap, arg);
+    for (char **a = argv; a < (argv + argc); a++)
+        *a = va_arg(ap, char *);
+    char **envp = va_arg(ap, char **);
+    va_end(ap);
+
+    int r = execve(pathname, argv, envp);
+    free(argv);
+    return r;
+}
+
+int execv(const char *pathname, char *const argv[])
+{
+    if (!main_task)
+        return CALL_FUNC(execv, pathname, argv);
+    
+    return execve(pathname, argv, tvm_environ);
+}
+
+int execvp(const char *file, char *const argv[])
+{
+    if (!main_task)
+        return CALL_FUNC(execvp, file, argv);
+    
+    return execvpe(file, argv, tvm_environ);
+}
+
+int execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    if (!main_task)
+        return CALL_FUNC(execvpe, file, argv, envp);
+    
+    const char *pathname = find_program_pathname(file);
+    if (!pathname) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    return execve(pathname, argv, envp);
 }
