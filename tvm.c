@@ -269,6 +269,12 @@ DECL_FUNC(sigaction);
 DECL_FUNC(raise);
 DECL_FUNC(kill);
 
+DECL_FUNC(getenv);
+DECL_FUNC(putenv);
+DECL_FUNC(setenv);
+DECL_FUNC(unsetenv);
+DECL_FUNC(clearenv);
+
 __attribute__((constructor))
 static void init_funcs()
 {
@@ -394,6 +400,95 @@ static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
 #endif
 
 /////////////
+// Environment
+/////////////
+
+extern char **environ;
+
+/**
+ * Excluding last NULL byte.
+ */
+static size_t envsize(char **env)
+{
+    int sz = 0;
+    if (env) {
+        for (char **e = env; *e != NULL; e++)
+            sz++;
+    }
+    return sz;
+}
+
+static char **copyenv(char **env)
+{
+    if (!env)
+        return NULL;
+    
+    int ok = 0;
+    int sz = envsize(env);
+
+    char **r = malloc(sizeof(char *) * (sz+1));
+    if (!r)
+        goto out;
+    memset(r, 0, sizeof(char *) * (sz+1));
+    
+    for (int i = 0; i < sz; i++) {
+        r[i] = strdup(env[i]);
+        if (!r[i]) {
+            goto out;
+        }
+    }
+
+    ok = 1;
+
+out:
+
+    if (!ok) {
+        if (r) {
+            for (char **e = r; *e != NULL; e++)
+                free(e);
+            free(r);
+        }
+        return NULL;
+    }
+
+    return r;
+}
+
+static char **addenv(char **env, char *string)
+{
+    int sz = envsize(env);
+    char **newenv = malloc(sizeof(char *) * (sz+2));
+    if (!newenv)
+        return NULL;
+    
+    newenv[sz] = string;
+    newenv[sz + 1] = 0;
+
+    if (env)
+        memcpy(newenv, env, sizeof(char *) * sz);
+    
+    return newenv;
+}
+
+static char **findenv(char **env, const char *name, size_t name_len)
+{
+    if (env) {
+        for (char **e = env; *e != NULL; e++) {
+            if (0 == strncmp(*e, name, name_len)) {
+                if ((*e)[name_len] == '=') {
+                    return e;
+                }
+                if ((*e)[name_len] == 0) {
+                    return e;
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/////////////
 // Task
 /////////////
 
@@ -435,6 +530,7 @@ struct task
     struct list_head tsk_pthreads;  // pthread_entry
     pid_t tsk_sid;
     pid_t tsk_pgid;
+    char **tsk_environ;
 };
 
 static pthread_t main_pthread;
@@ -491,6 +587,10 @@ static struct task *taskalloc()
         t->tsk_f[1] = stdout;
         t->tsk_f[2] = stderr;
 
+        t->tsk_environ = copyenv(environ);
+        if (!t->tsk_environ)
+            panic("copyenv");
+
         if (-1 == (t->tsk_sid = CALL_FUNC(getsid, 0)))
             panic("getsid");
         if (-1 == (t->tsk_pgid = CALL_FUNC(getpgid, 0)))
@@ -501,13 +601,16 @@ static struct task *taskalloc()
             panic("taskalloc make_pthread_entry");
         list_add_tail(&pent->ptl_entry, &t->tsk_pthreads);
         ++t->tsk_pthreads_count;
-
     } else {
         task_lock(current);
         t->tsk_parent = current;
         t->tsk_pid = -1;
         t->tsk_sid = current->tsk_sid;
         t->tsk_pgid = current->tsk_pgid;
+
+        t->tsk_environ = copyenv(current->tsk_environ);
+        if (!t->tsk_environ)
+            panic("copyenv");
 
         for (int i = 0; i < MAX_FILES; i++) {
             if (t->tsk_parent->tsk_fd[i] == -1)
@@ -551,6 +654,10 @@ static void taskdealloc(struct task *t)
     free(pentry);
     if (!list_empty(&t->tsk_pthreads))
         panic("taskalloc tsk_pthreads not one");
+
+    // TODO might be bad to free env
+    //for (char **e = t->tsk_environ; *e != NULL; e++)
+        //free(*e);
 
     pthread_cond_destroy(&t->tsk_wait_cond);
     pthread_mutex_destroy(&t->tsk_wait_lock);
@@ -1155,7 +1262,9 @@ pid_t fork(void)
     return pid;
 }
 
-// control functions
+/////////////
+// API functions
+/////////////
 
 void tvm_init()
 {
@@ -1179,6 +1288,14 @@ void tvm_init()
     }
 
     task_unlock(current);
+}
+
+char ***_tvm_environ()
+{
+    if (!main_task)
+        return &environ;
+    
+    return &current->tsk_environ;
 }
 
 #define MAX_BT 16
@@ -2059,4 +2176,160 @@ int kill(pid_t pid, int sig) {
     }
 
     return r;
+}
+
+char *getenv(const char *name)
+{
+    if (!main_task)
+        return CALL_FUNC(getenv, name);
+
+    task_lock(current);
+    char **env = NULL;
+    if (current->tsk_environ)
+        env = findenv(current->tsk_environ, name, strlen(name));
+
+    if (!env) {
+        task_unlock(current);
+        return NULL;
+    }
+    
+    char *ret = strchr(*env, '=');
+    task_unlock(current);
+    if (ret)
+        return ret+1;
+    
+    return ret;
+}
+
+int putenv(char *string)
+{
+    if (!main_task)
+        return CALL_FUNC(putenv, string);
+
+    char *value = strchr(string, '=');
+    size_t klen;
+    if (NULL == value) {
+        value = string + strlen(string);
+        klen = (size_t)(value - string);
+    }
+    else {
+        klen = (size_t)(value - string);
+        value++;
+    }
+    
+    task_lock(current);
+    char **env = NULL;
+    if (current->tsk_environ)
+        env = findenv(current->tsk_environ, string, klen);
+    
+    if (env) {
+        *env = string;
+        task_unlock(current);
+        return 0;
+    }
+
+    char **new_environ = addenv(current->tsk_environ, string);
+    if (!new_environ) {
+        task_unlock(current);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    // TODO not sure if this is a good idea
+    //free(current->tsk_environ);
+    current->tsk_environ = new_environ;
+    task_unlock(current);
+
+    return 0;
+}
+
+int setenv(const char *name, const char *value, int overwrite)
+{
+    if (!main_task)
+        return CALL_FUNC(setenv, name, value, overwrite);
+
+    size_t name_len = strlen(name);
+    size_t value_len = strlen(value);
+    char *string = malloc(name_len + value_len + 2);
+    if (!string) {
+        errno = ENOMEM;
+        return -1;
+    }
+    memcpy(string, name, name_len);
+    string[name_len] = '=';
+    memcpy(string + name_len + 1, value, value_len);
+
+    task_lock(current);
+    char **env = NULL;
+    if (current->tsk_environ)
+        env = findenv(current->tsk_environ, name, strlen(name));
+    
+    if (env) {
+        if (overwrite)
+            *env = string;
+        else
+            free(string);
+        task_unlock(current);
+        return 0;    
+    }
+
+    char **new_environ = addenv(current->tsk_environ, string);
+    if (!new_environ) {
+        task_unlock(current);
+        free(string);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    // TODO not sure if this is a good idea
+    //free(current->tsk_environ);
+    current->tsk_environ = new_environ;
+    task_unlock(current);
+
+    return 0;
+}
+
+int unsetenv(const char *name)
+{
+    if (!main_task)
+        return CALL_FUNC(unsetenv, name);
+    
+    if (name == NULL || *name == '\0' || strchr(name, '=') != NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t len = strlen(name);
+
+    task_lock(current);
+    if (!current->tsk_environ) {
+        task_unlock(current);
+        return 0;
+    }
+
+    for (char **e = current->tsk_environ; *e != NULL;) {
+	    if (!strncmp (*e, name, len) && (*e)[len] == '=') {
+            for (char **e2 = e; *e2 != NULL; e2++)
+                e2[0] = e2[1];
+	        continue;
+	    }
+        e++;
+    }
+
+    task_unlock(current);
+
+    return 0;
+}
+
+int clearenv(void)
+{
+    if (!main_task)
+        return CALL_FUNC(clearenv);
+    
+    task_lock(current);
+    current->tsk_environ = NULL;
+    task_unlock(current);
+
+    return 0;
 }

@@ -511,6 +511,94 @@ TEST(COWSingleThreaded) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+extern char **environ;
+
+TEST(EnvBasic) {
+    for (char **e = environ, **te = tvm_environ; *e != NULL; e++, te++) {
+        ASSERT_NEQ(NULL, *te);
+        ASSERT_EQ(0, strcmp(*e, *te));
+    }
+
+    ASSERT_EQ(NULL, getenv("kd85n2lk2"));
+    ASSERT_EQ(0, putenv("kd85n2lk2=1"));
+    ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
+    ASSERT_EQ(0, strcmp("1", getenv("kd85n2lk2")));
+    
+    char **e;
+    for (e = tvm_environ; *(e+1) != NULL; e++) { }
+    ASSERT_EQ(0, strcmp(*e, "kd85n2lk2=1"));
+
+    ASSERT_EQ(0, unsetenv("kd85n2lk2"));
+    ASSERT_EQ(NULL, getenv("kd85n2lk2"));
+
+    ASSERT_EQ(0, putenv("kd85n2lk2=2"));
+    ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
+    ASSERT_EQ(0, strcmp("2", getenv("kd85n2lk2")));
+    ASSERT_EQ(0, unsetenv("kd85n2lk2"));
+
+    ASSERT_EQ(0, setenv("kd85n2lk2", "3", 0));
+    ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
+    ASSERT_EQ(0, strcmp("3", getenv("kd85n2lk2")));
+
+    ASSERT_EQ(0, setenv("kd85n2lk2", "4", 0));
+    ASSERT_NEQ(NULL, getenv("kd85n2lk2"));
+    ASSERT_EQ(0, strcmp("3", getenv("kd85n2lk2")));
+
+    ASSERT_NEQ(NULL, tvm_environ[0]);
+}
+
+TEST(EnvFork) {
+    ASSERT_EQ(NULL, getenv("kd85n2lk2"));
+    ASSERT_EQ(0, putenv("kd85n2lk2=1"));
+    ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        tvm_environ[0] = "lol";
+        if (!getenv("kd85n2lk2"))
+            _exit(1);
+        if (0 != strcmp(getenv("kd85n2lk2"), "1"))
+            _exit(2);
+        if (0 != setenv("kd85n2lk2", "2", 1))
+            _exit(3);
+        if (0 != strcmp(getenv("kd85n2lk2"), "2"))
+            _exit(4);
+        
+        usleep(200000);
+        
+        if (0 != strcmp(getenv("kd85n2lk2"), "2"))
+            _exit(5);
+        _exit(0);
+    }
+
+    usleep(100000);
+
+    ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
+    ASSERT_EQ(0, setenv("kd85n2lk2", "3", 1));
+    ASSERT_NEQ(0, strcmp(tvm_environ[0], "lol"));
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(EnvNULL) {
+    ASSERT_NEQ(NULL, getenv("PATH"));
+    ASSERT_EQ(0, clearenv());
+    ASSERT_EQ(tvm_environ, NULL);
+    ASSERT_EQ(NULL, getenv("PATH"));
+    ASSERT_EQ(0, unsetenv("PATH"));
+    ASSERT_EQ(tvm_environ, NULL);
+
+    ASSERT_EQ(0, putenv("hello=world"));
+    ASSERT_NEQ(NULL, getenv("hello"));
+    ASSERT_EQ(0, strcmp(getenv("hello"), "world"));
+    ASSERT_NEQ(tvm_environ, NULL);
+}
+
 //////////
 //// Framework
 //////////

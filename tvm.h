@@ -9,3 +9,6 @@
 void _tvm_register_cow(void *(*getptr_fn)(), size_t size);
     
 void tvm_init();
+
+#define tvm_environ (*(_tvm_environ()))
+char ***_tvm_environ();
