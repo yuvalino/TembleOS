@@ -25,6 +25,7 @@
 #include <sys/file.h>
 #include <limits.h>
 #include <termios.h>
+#include <pty.h>
 
 #include "tvm.h"
 
@@ -284,6 +285,8 @@ DECL_FUNC(execle);
 DECL_FUNC(execv);
 DECL_FUNC(execvp);
 DECL_FUNC(execvpe);
+
+DECL_FUNC(openpty);
 
 DECL_FUNC(tcgetpgrp);
 DECL_FUNC(tcsetpgrp);
@@ -2631,6 +2634,44 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
     }
 
     return execve(pathname, argv, envp);
+}
+
+int openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp)
+{
+    if (!main_task)
+        return CALL_FUNC(openpty, amaster, aslave, name, termp, winp);
+    
+    int master, slave;
+    int r = CALL_FUNC(openpty, (amaster ? &master : NULL), (aslave ? &slave : NULL), name, termp, winp);
+    if (r != 0)
+        return r;
+    
+    if (amaster) {
+        int f = task_new_fd(current, 0, master);
+        if (f == -1) {
+            CALL_FUNC(close, master);
+            if (aslave)
+                CALL_FUNC(close, slave);
+            errno = ENOMEM;
+        }
+        *amaster = f;
+    }
+
+    if (aslave) {
+        int f = task_new_fd(current, 0, slave);
+        if (f == -1) {
+            if (amaster) {
+                close(*amaster);
+                *amaster = -1;
+            }
+            CALL_FUNC(close, slave);
+            errno = ENOMEM;
+        }
+        *aslave = f;
+    }
+    return r;
+    
+
 }
 
 pid_t tcgetpgrp(int fd)

@@ -7,7 +7,7 @@ all: forkless
 clean:
 	@make -C dropbear/ clean
 
-forkless: mksh #dropbear
+forkless: dropbear #mksh
 	gcc -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -lz -lpthread -lutil -pie
 
 test:
