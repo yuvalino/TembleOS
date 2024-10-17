@@ -284,6 +284,12 @@ DECL_FUNC(execv);
 DECL_FUNC(execvp);
 DECL_FUNC(execvpe);
 
+DECL_FUNC(tcgetpgrp);
+DECL_FUNC(tcsetpgrp);
+DECL_FUNC(isatty);
+DECL_FUNC(ttyname);
+DECL_FUNC(ttyname_r);
+
 __attribute__((constructor))
 static void init_funcs()
 {
@@ -998,11 +1004,12 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 struct cow_variable_t {
     struct list_head list;
     void *(*getptr_fn)();
+    void (*init_fn)();
     size_t size;
 };
 static LIST_HEAD(cow_variables);
 
-void _tvm_register_cow(void *(*getptr_fn)(), size_t size)
+void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)())
 {
     struct cow_variable_t *cowvar;
     if (NULL == (cowvar = malloc(sizeof(*cowvar))))
@@ -1010,6 +1017,7 @@ void _tvm_register_cow(void *(*getptr_fn)(), size_t size)
     
     list_add_tail(&cowvar->list, &cow_variables);
     cowvar->getptr_fn = getptr_fn;
+    cowvar->init_fn = init_fn;
     cowvar->size = size; 
 }
 
@@ -1065,6 +1073,15 @@ static int cow_set_thread_ptrs(void **data)
         return 2;
     
     return 0;
+}
+
+static void cow_run_init_funcs()
+{
+    struct cow_variable_t *cow;
+    list_for_each_entry(cow, &cow_variables, list) {
+        if (cow->init_fn)
+            cow->init_fn();
+    }
 }
 
 /////////////
@@ -1350,6 +1367,8 @@ void tvm_init()
 {
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
+
+    cow_run_init_funcs(); // initialize copy-on-write vars with init statements
 
     task_lock(current);
     
@@ -2472,6 +2491,8 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
     
     // TODO if 0, 1, 2 we can be nice and open /dev/full, /dev/null and /dev/null for the program
 
+    cow_run_init_funcs(); // re-initialize copy-on-write vars with init statements
+
     exit(main_func(argc, argv, envp));
 }
 
@@ -2602,3 +2623,18 @@ int execvpe(const char *file, char *const argv[], char *const envp[])
 
     return execve(pathname, argv, envp);
 }
+
+pid_t tcgetpgrp(int fd)
+{ return CALL_FUNC(tcgetpgrp, t_fd(fd)); }
+
+pid_t tcsetpgrp(int fd, pid_t pgrp)
+{ return CALL_FUNC(tcsetpgrp, t_fd(fd), pgrp); }
+
+int isatty(int fd)
+{ return CALL_FUNC(isatty, t_fd(fd)); }
+
+char *ttyname(int fd)
+{ return CALL_FUNC(ttyname, t_fd(fd)); }
+
+int ttyname_r(int fd, char *buf, size_t buflen)
+{ return CALL_FUNC(ttyname_r, t_fd(fd), buf, buflen); }
