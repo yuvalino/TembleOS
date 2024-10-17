@@ -7,14 +7,14 @@ all: forkless
 clean:
 	@make -C dropbear/ clean
 
-forkless: dropbear #mksh
+forkless: mksh #dropbear
 	gcc -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -lz -lpthread -lutil -pie
 
 test:
 	gcc -I. tvm.c test_tvm.c -o test_forkless -lpthread -pie
 
 mksh:
-	@if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && sh ./Build.sh; fi
+	@if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
 	@objcopy --redefine-sym main=mksh_main mksh/main.o
 	@ar rcs libmksh.a $(shell find mksh/ -type f -name '*.o')
 

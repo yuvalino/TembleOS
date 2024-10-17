@@ -24,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 #include <limits.h>
+#include <termios.h>
 
 #include "tvm.h"
 
@@ -289,6 +290,14 @@ DECL_FUNC(tcsetpgrp);
 DECL_FUNC(isatty);
 DECL_FUNC(ttyname);
 DECL_FUNC(ttyname_r);
+
+DECL_FUNC(tcgetattr);
+DECL_FUNC(tcsetattr);
+DECL_FUNC(tcsendbreak);
+DECL_FUNC(tcdrain);
+DECL_FUNC(tcflush);
+DECL_FUNC(tcflow);
+
 
 __attribute__((constructor))
 static void init_funcs()
@@ -2638,3 +2647,21 @@ char *ttyname(int fd)
 
 int ttyname_r(int fd, char *buf, size_t buflen)
 { return CALL_FUNC(ttyname_r, t_fd(fd), buf, buflen); }
+
+int tcgetattr(int fd, struct termios *termios_p)
+{ return CALL_FUNC(tcgetattr, t_fd(fd), termios_p); }
+
+int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
+{ return CALL_FUNC(tcsetattr, t_fd(fd), optional_actions, termios_p); }
+
+int tcsendbreak(int fd, int duration)
+{ return CALL_FUNC(tcsendbreak, t_fd(fd), duration); }
+
+int tcdrain(int fd)
+{ return CALL_FUNC(tcdrain, t_fd(fd)); }
+
+int tcflush(int fd, int queue_selector)
+{ return CALL_FUNC(tcflush, t_fd(fd), queue_selector); }
+
+int tcflow(int fd, int action)
+{ return CALL_FUNC(tcflow, t_fd(fd), action); }

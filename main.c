@@ -58,9 +58,20 @@ int main(int argc, char **argv)
     printf("Hello, World!\n");
     char *nargv[] = {
         argv[0],
-        "-F",
-        "-E",
         NULL
     };
-    return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
+    return mksh_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
 }
+
+// int main(int argc, char **argv)
+// {
+//     tvm_init();
+//     printf("Hello, World!\n");
+//     char *nargv[] = {
+//         argv[0],
+//         "-F",
+//         "-E",
+//         NULL
+//     };
+//     return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
+// }
