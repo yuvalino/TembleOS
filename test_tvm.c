@@ -13,8 +13,6 @@
 
 #include "tvm.h"
 
-//#define _DEBUG 1
-
 //////////
 //// API
 //////////
@@ -693,7 +691,7 @@ void _add_test(const char *n, void (*f)())
     tests[idx].n = n;
 }
 
-static int runtest(struct testinfo_t *testinfo)
+static int runtest(struct testinfo_t *testinfo, int verbose)
 {
     int outp[2] = {-1, -1};
     if (-1 == pipe(outp)) {
@@ -740,9 +738,7 @@ static int runtest(struct testinfo_t *testinfo)
     close(errp[1]);
     int status = 0;
     char tmp[0x4000] = {0};
-#ifdef _DEBUG
     int newline = 1;
-#endif
 
     while (1) {
         if (-1 == usleep(2)) {
@@ -759,13 +755,14 @@ static int runtest(struct testinfo_t *testinfo)
             b = 0;
         }
         if (b) {
-#ifdef _DEBUG
-            if (newline) {
-                printf("\n");
-                newline = 0;
+            if (verbose)
+            {
+                if (newline) {
+                    printf("\n");
+                    newline = 0;
+                }
+                write(1, tmp, b);
             }
-            write(1, tmp, b);
-#endif
             testinfo->out = realloc(testinfo->out, testinfo->out_s + b);
             if (!testinfo->out) {
                 perror("realloc(out)");
@@ -784,13 +781,13 @@ static int runtest(struct testinfo_t *testinfo)
             b = 0;
         }
         if (b) {
-#ifdef _DEBUG
-            if (newline) {
-                printf("\n");
-                newline = 0;
+            if (verbose) {
+                if (newline) {
+                    printf("\n");
+                    newline = 0;
+                }
+                write(1, tmp, b);
             }
-            write(1, tmp, b);
-#endif
             testinfo->err = realloc(testinfo->err, testinfo->err_s + b);
             if (!testinfo->err) {
                 perror("realloc(err)");
@@ -834,6 +831,8 @@ void helpexit(char *exe)
     printf("Run tests\n\n");
     printf("  -l             print test list and exit\n");
     printf("  -k=TEST        only run TEST (can be passed multiple times)\n");
+    printf("  -v             verbose output\n");
+    printf("  -v             debug with gdb\n");
     printf("  -h             display this help and exit\n");
     exit(0);
 }
@@ -850,6 +849,36 @@ void listtests(char *exe)
     exit(0);
 }
 
+int gdb(int argc, char **argv)
+{
+    const char *gargv[] = {
+        "gdb",
+        "-ex",
+        "set follow-fork-mode child",
+        "-ex",
+        "r",
+        "--args"
+    };
+    int gargc = sizeof(gargv)/sizeof(*gargv);
+
+    putenv("TEST_IN_GDB=1");
+
+    int nargc = gargc + argc;
+    char **nargv = malloc((nargc+1) * sizeof(char *));
+    if (!nargv) {
+        errno = ENOMEM;
+        perror("gdb");
+        exit(1);
+    }
+    memcpy(nargv, gargv, gargc * sizeof(char *));
+    memcpy(nargv + gargc, argv, argc * sizeof(char *));
+    nargv[nargc] = 0;
+
+    execvp("gdb", nargv);
+    perror("execvp(\"gdb\")");
+    exit(1);
+}
+
 int main(int argc, char **argv)
 {
     setbuf(stdout, NULL);
@@ -857,17 +886,25 @@ int main(int argc, char **argv)
     int test_names_s = 0;
     char **test_names = NULL;
     int c;
+    int verbose = 0;
 
     do {
-        c = getopt(argc, argv, "hlk:");
+        c = getopt(argc, argv, "hlgvk:");
 
         if (c == 'h') {
             helpexit(argv[0]);
         }
-        if (c == 'l') {
+        else if (c == 'l') {
             listtests(argv[0]);
         }
-        if (c == 'k') {
+        else if (c == 'g') {
+            if (!getenv("TEST_IN_GDB") || 0 != strcmp(getenv("TEST_IN_GDB"), "1"))
+                gdb(argc, argv);
+        }
+        else if (c == 'v') {
+            verbose++;
+        }
+        else if (c == 'k') {
             test_names = realloc(test_names, test_names_s+1);
             if (!test_names) {
                 fprintf(stderr, "out of memory\n");
@@ -920,7 +957,7 @@ int main(int argc, char **argv)
                 continue;
         }
 
-        r = runtest(tests + i);
+        r = runtest(tests + i, verbose);
         if (r) {
             printf((r>0)?"F":"C");
             break;
