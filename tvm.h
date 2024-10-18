@@ -1,19 +1,27 @@
 #pragma once
 
-#define _COW_REG(Name, InitFunc) \
+#define __TVM_STRINGIFY(X) #X
+#define _TVM_STRINGIFY(X) __TVM_STRINGIFY(X)
+
+#define _COW_REG(Name, InitFunc, DeepCopy) \
     static void *_tvm_rcg_ ## Name () { return (& Name); } \
     __attribute__((constructor)) \
-    static void _tvm_rcc_ ## Name () { _tvm_register_cow(_tvm_rcg_ ## Name, sizeof(Name), InitFunc); }
-#define _COW_REG_INIT(Name, InitExpr) \
+    static void _tvm_rcc_ ## Name () { _tvm_register_cow(_tvm_rcg_ ## Name, sizeof(Name), InitFunc, DeepCopy, (__FILE__ ":" _TVM_STRINGIFY(__LINE__) " " #Name)); }
+#define _COW_REG_INIT(Name, InitExpr, DeepCopy) \
     static void _tvm_rci_ ## Name () { Name = (InitExpr); } \
-    _COW_REG(Name, _tvm_rci_ ## Name )
+    _COW_REG(Name, _tvm_rci_ ## Name, DeepCopy)
 
-#define COW_IMPL_INIT(Type, Name, InitExpr) __thread Type Name; _COW_REG_INIT(Name, InitExpr)
-#define COW_IMPL(Type, Name) __thread Type Name; _COW_REG(Name, NULL)
-#define COW_IMPL_ARRAY(Type, Name, Size) __thread Type Name [Size]; _COW_REG(Name, NULL)
+#define COW_IMPL_INIT(Type, Name, InitExpr) __thread Type Name; _COW_REG_INIT(Name, InitExpr, 1)
+#define COW_IMPL(Type, Name) __thread Type Name; _COW_REG(Name, NULL, 1)
+#define COW_IMPL_ARRAY(Type, Name, Size) __thread Type Name [Size]; _COW_REG(Name, NULL, 1)
+
+#define COW_IMPL_INIT_SHALLOW(Type, Name, InitExpr) __thread Type Name; _COW_REG_INIT(Name, InitExpr, 0)
+#define COW_IMPL_SHALLOW(Type, Name) __thread Type Name; _COW_REG(Name, NULL, 0)
+#define COW_IMPL_ARRAY_SHALLOW(Type, Name, Size) __thread Type Name [Size]; _COW_REG(Name, NULL, 0)
+
 #define COW_DECL(TypeName) extern __thread TypeName
     
-void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)());
+void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)(), int deepcopy, char *name);
     
 void tvm_init();
 

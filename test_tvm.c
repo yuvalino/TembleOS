@@ -509,6 +509,55 @@ TEST(COWSingleThreaded) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+static COW_IMPL(struct {
+    int val;
+    char *ptr;  
+}, cow_deep);
+
+TEST(COWDeepCopy) {
+    cow_deep.val = 69;
+    cow_deep.ptr = malloc(0x69);
+    ASSERT_NEQ(NULL, cow_deep.ptr);
+    memset(cow_deep.ptr, 'A', 0x69);
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (cow_deep.ptr == NULL)
+            _exit(1);
+        for (int i = 0; i < 0x69; i++) {
+            if (cow_deep.ptr[i] != 'A')
+                _exit(2);
+        }
+        
+        usleep(200000);
+
+        for (int i = 0; i < 0x69; i++) {
+            if (cow_deep.ptr[i] != 'A')
+                _exit(3);
+        }
+
+        _exit(0);
+    }
+
+    usleep(100000);
+
+    for (int i = 0; i < 0x69; i++) {
+        if (cow_deep.ptr[i] != 'A')
+            _exit(4);
+    }
+    memset(cow_deep.ptr, 'B', 0x69);
+
+    usleep(200000);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+
 extern char **environ;
 
 TEST(EnvBasic) {

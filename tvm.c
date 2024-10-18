@@ -26,6 +26,7 @@
 #include <limits.h>
 #include <termios.h>
 #include <pty.h>
+#include <malloc.h>
 
 #include "tvm.h"
 
@@ -55,6 +56,8 @@ static void __panic(const char *m, const char *f, int l);
         (type *)((char *)__mptr - offsetof(type,member));})
 
 #define INFO(Msg, ...) do { CALL_FUNC(printf, "Kernel(%d): %s: " Msg "\n", __gettid(), __FUNCTION__, ##__VA_ARGS__); } while (0)
+
+#define MALLOC_MAGIC ((uintptr_t) 0xFACEFACE)
 
 /////////////
 // List
@@ -301,6 +304,9 @@ DECL_FUNC(tcdrain);
 DECL_FUNC(tcflush);
 DECL_FUNC(tcflow);
 
+DECL_FUNC(malloc);
+DECL_FUNC(realloc);
+DECL_FUNC(free);
 
 __attribute__((constructor))
 static void init_funcs()
@@ -964,9 +970,14 @@ static const int default_signal_actions[MAX_SIGNALS] = {
     [SIGSYS]    = SAD_CORE, // 31
 };
 
+static __thread int sigshutup = 0;
+
 void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
-    INFO("signum=%d", signum);
+    if (!sigshutup) {
+        INFO("signum=%d", signum);
+    }
+
     if (!current)
         panic("signal %d on pthread_exit", signum);
     
@@ -1013,15 +1024,19 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 // Copy-On-Write (COW)
 /////////////
 
+#define COW_DEEPCOPY 0x1
+
 struct cow_variable_t {
     struct list_head list;
     void *(*getptr_fn)();
     void (*init_fn)();
+    char *name; // for debugging purposes
     size_t size;
+    int flags;
 };
 static LIST_HEAD(cow_variables);
 
-void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)())
+void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)(), int deepcopy, char *name)
 {
     struct cow_variable_t *cowvar;
     if (NULL == (cowvar = malloc(sizeof(*cowvar))))
@@ -1030,7 +1045,10 @@ void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)())
     list_add_tail(&cowvar->list, &cow_variables);
     cowvar->getptr_fn = getptr_fn;
     cowvar->init_fn = init_fn;
-    cowvar->size = size; 
+    cowvar->name = name;
+    cowvar->size = size;
+    if (deepcopy) 
+        cowvar->flags |= COW_DEEPCOPY;
 }
 
 static int cow_get_thread_ptrs(void ***out_data)
@@ -1068,16 +1086,85 @@ static int cow_get_thread_ptrs(void ***out_data)
     return 0;
 }
 
+// TODO words cannot explain how retarded this is
+static pthread_mutex_t ptrchk_lock = PTHREAD_MUTEX_INITIALIZER;
+static jmp_buf ptrchk_retbuf;
+static void ptrchk_handler(int) { siglongjmp(ptrchk_retbuf, 2); }
+static int is_valid_ptr(void *ptr)
+{
+    int jmpval;
+    struct sigaction segvoldact, busoldact, act = { .sa_handler = ptrchk_handler };
+
+    pthread_mutex_lock(&ptrchk_lock);
+    int oldsigshutup = sigshutup;
+    sigshutup = 1;
+
+    if (0 != sigaction(SIGSEGV, &act, &segvoldact))
+        panic("sigaction(SIGSEGV, act)");
+    if (0 != sigaction(SIGBUS, &act, &busoldact))
+        panic("sigaction(SIGBUS, act)");
+
+    // need sigsetjmp because we're longjmp'ing from signal handler
+    if (0 != (jmpval = sigsetjmp(ptrchk_retbuf, 1)))
+    {
+        if (0 != sigaction(SIGSEGV, &segvoldact, NULL))
+            panic("sigaction(SIGSEGV, oldact)");
+        if (0 != sigaction(SIGBUS, &busoldact, NULL))
+            panic("sigaction(SIGBUS, oldact)");
+        
+        sigshutup = oldsigshutup;
+        pthread_mutex_unlock(&ptrchk_lock);
+
+        return (jmpval == 1);
+    }
+
+    int a = *((int *)ptr);
+    siglongjmp(ptrchk_retbuf, 1);
+}
+
+static void cow_deepcopy(void *buffer, size_t size)
+{
+    uintptr_t **end = (uintptr_t **) (((char *) buffer) + size);
+
+    // TODO ensure malloc always zeroes out memory?
+
+    for (uintptr_t **p = (uintptr_t **)buffer; p < end; p++) {
+        uintptr_t *pp = (*p)-1;
+        if (!is_valid_ptr((void *) pp))
+            continue;
+
+        if (*pp != MALLOC_MAGIC)
+            continue;
+
+        size_t heap_size = malloc_usable_size((void *) pp);
+        if (!heap_size)
+            continue;
+
+        uintptr_t *newptr = CALL_FUNC(malloc, heap_size);
+        if (!newptr)
+            panic("newptr = malloc(0x%zx)", heap_size);
+        *p = (newptr+1);
+        memcpy(newptr, pp, heap_size);
+        cow_deepcopy(newptr+1, heap_size-sizeof(uintptr_t));
+    }
+}
+
 static int cow_set_thread_ptrs(void **data)
 {
     struct cow_variable_t *cow;
     
+    // TODO deepcopy circular dependency
+
     list_for_each_entry(cow, &cow_variables, list) {
         if (*data == NULL) {
             return 1;
         }
 
         memcpy(cow->getptr_fn(), *data, cow->size);
+
+        if (cow->flags & COW_DEEPCOPY)
+            cow_deepcopy(cow->getptr_fn(), cow->size);
+        
         data++;
     }
 
@@ -1093,6 +1180,8 @@ static void cow_run_init_funcs()
     list_for_each_entry(cow, &cow_variables, list) {
         if (cow->init_fn)
             cow->init_fn();
+        else
+            memset(cow->getptr_fn(), 0, cow->size);
     }
 }
 
@@ -2505,6 +2594,10 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
 
     cow_run_init_funcs(); // re-initialize copy-on-write vars with init statements
 
+    // TODO hack, getopt should have a tvm thread-safe version
+    extern int optind;
+    optind = 1;
+
     exit(main_func(argc, argv, envp));
 }
 
@@ -2706,3 +2799,42 @@ int tcflush(int fd, int queue_selector)
 
 int tcflow(int fd, int action)
 { return CALL_FUNC(tcflow, t_fd(fd), action); }
+
+void *malloc(size_t size)
+{
+    return calloc(1, size);
+}
+
+void *calloc(size_t nmemb, size_t size)
+{
+    if (0 == (nmemb * size))
+        return NULL;
+    
+    uintptr_t *p = CALL_FUNC(malloc, (nmemb * size)+sizeof(uintptr_t));
+    if (NULL == p)
+        return p;
+    
+    *p = MALLOC_MAGIC;
+    memset(p+1, 0, nmemb * size);
+    return p+1;
+}
+
+void free(void *ptr)
+{
+    uintptr_t *p = (uintptr_t *)ptr;
+    if (NULL == p || p[-1] != MALLOC_MAGIC)
+        return CALL_FUNC(free, p);
+    
+    return CALL_FUNC(free, p-1);
+}
+
+void *realloc(void *ptr, size_t size)
+{
+    void *nptr = malloc(size);
+    if (ptr != NULL) {
+        if (nptr != NULL)
+            memmove(nptr, ptr, size);
+        free(ptr);
+    }
+    return nptr;
+}
