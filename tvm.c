@@ -2346,40 +2346,125 @@ int raise(int sig) {
 }
 
 int kill(pid_t pid, int sig) {
-    // TODO support any other pid other than `pid>0`
-    if (pid <= 0) {
+    if (!main_task)
+        return CALL_FUNC(kill, pid, sig);
+    
+    if (pid == 0) {
+        task_lock(current);
+        pid = current->tsk_pgid;
+        task_unlock(current);
+
+        // should be positive but not 1 (-1 isn't want we would like to call kill with)
+        if (pid <= 1)
+            panic("kill self pgid (%d)", pid);
+        
+        return kill(-pid, sig);
+    }
+
+    // handle single target process
+    if (pid > 0) {
+
+        // special case: kill to self
+        if (pid == current->tsk_pid)
+            return raise(sig);
+
+        struct task *t;
+        // special case: kill an external process to the tvm
+        if (!(t = task_for_pid(pid)))
+            return CALL_FUNC(kill, pid, sig);
+
+        task_lock(t);
+        if (t->tsk_state & TS_ZOMBIE) {
+            task_unlock(t);
+            errno = ESRCH;
+            return -1;
+        }
+
+        int r = task_kill_locked(t, sig);
+        if (r == ESRCH)
+            panic("kill(%d) no threads?", pid);
+        task_unlock(t);
+
+        if (r != 0) {
+            errno = r;
+            r = -1;
+        }
+
+        return r;
+    }
+
+    // Kill all processes with permissions not supported
+    if (pid == -1) {
         errno = EINVAL;
         return -1;
     }
 
-    if (pid == current->tsk_pid) {
-        // TODO not sure if this is okay if current thread is not main thread
-        return raise(sig);
-    }
+    // Kill all processes in process group, pid is -pgid
 
+    int self = 0;
+    int ntasks = 0;
+    struct task **tasks = NULL;
+    
+    task_lock(current);
+    pthread_mutex_lock(&tasks_lock);
     struct task *t;
-    if (!(t = task_for_pid(pid))) {
-        return CALL_FUNC(kill, pid, sig);
+    list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
+        if (t->tsk_pgid == -pid) {
+            if (t == current) {
+                self = 1;
+                continue;
+            }
+
+            struct task **new_tasks = malloc(sizeof(struct task *) * (ntasks + 1));
+            if (!new_tasks) {
+                for (int i = 0; i < ntasks; i++)
+                    task_unlock(tasks[i]);
+                free(tasks);
+                errno = ENOMEM;
+                return -1;
+            }
+
+            task_lock(t);
+            memmove(new_tasks, tasks, sizeof(struct task *) * ntasks);
+            new_tasks[ntasks] = t;
+            free(tasks);
+            tasks = new_tasks;
+            ntasks++;
+        }
+    }
+    pthread_mutex_unlock(&tasks_lock);
+
+    if (!self) {
+        task_unlock(current);
+
+        if (!ntasks) {
+            errno = ESRCH;
+            return -1;
+        }
     }
     
-    task_lock(t);
-    if (t->tsk_state & TS_ZOMBIE) {
-        task_unlock(t);
-        errno = ESRCH;
-        return -1;
+    int one_ok = 0;
+    for (int i = 0; i < ntasks; i++) {
+        int r = task_kill_locked(tasks[i], sig);
+        if (0 == r)
+            one_ok = 1;
+        else
+            errno = r;
     }
 
-    int r = task_kill_locked(t, sig);
-    if (r == ESRCH)
-        panic("kill(%d) no threads?", pid);
-    task_unlock(t);
-
-    if (r != 0) {
-        errno = r;
-        r = -1;
+    for (int i = 0; i < ntasks; i++)
+        task_unlock(tasks[i]);
+    
+    if (self) {
+        int r = task_kill_locked(current, sig);
+        if (0 == r)
+            one_ok = 1;
+        else
+            errno = r;
+        task_unlock(current);
     }
 
-    return r;
+    return (one_ok ? 0 : -1);
 }
 
 char *getenv(const char *name)

@@ -367,6 +367,26 @@ TEST(SignalsSIGCHLD) {
     ASSERT_EQ(testhandlersig, 2);
 }
 
+TEST(SignalsPgrp) {
+    pid_t p1 = fork();
+    ASSERT_NEQ(p1, -1);
+    if (!p1) {
+        if (0 != setpgid(0, 0))
+            _exit(1);
+        pause();
+        _exit(0);
+    }
+
+    usleep(100000);
+    
+    ASSERT_EQ(0, kill(-p1, SIGTERM));
+
+    int s;
+    ASSERT_EQ(p1, wait(&s));
+    ASSERT_EQ(WIFSIGNALED(s), 1);
+    ASSERT_EQ(WTERMSIG(s), SIGTERM);
+}
+
 TEST(FDsInit) {
     ASSERT_EQ(-1, close(3));
     ASSERT_EQ(3, open("/dev/random", O_RDONLY));
