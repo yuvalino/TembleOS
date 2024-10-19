@@ -27,6 +27,7 @@
 #include <termios.h>
 #include <pty.h>
 #include <malloc.h>
+#include <getopt.h>
 
 #include "tvm.h"
 
@@ -307,6 +308,10 @@ DECL_FUNC(tcflow);
 DECL_FUNC(malloc);
 DECL_FUNC(realloc);
 DECL_FUNC(free);
+
+DECL_FUNC(getopt);
+DECL_FUNC(getopt_long);
+DECL_FUNC(getopt_long_only);
 
 __attribute__((constructor))
 static void init_funcs()
@@ -1189,6 +1194,16 @@ static void cow_run_init_funcs()
             memset(cow->getptr_fn(), 0, cow->size);
     }
 }
+
+/////////////
+// Getopt
+/////////////
+
+__thread char *tvm_optarg;
+__thread int   tvm_optind = 1;
+__thread int   tvm_opterr;
+__thread int   tvm_optopt;
+static pthread_mutex_t getopt_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /////////////
 // Exec
@@ -2938,4 +2953,60 @@ void *realloc(void *ptr, size_t size)
         free(ptr);
     }
     return nptr;
+}
+
+int getopt(int argc, char * const argv[], const char *optstring)
+{
+    if (!main_task)
+        return CALL_FUNC(getopt, argc, argv, optstring);
+    
+    pthread_mutex_lock(&getopt_lock);
+    optarg = tvm_optarg;
+    optind = tvm_optind;
+    opterr = tvm_opterr;
+    optopt = tvm_optopt;
+    int r = CALL_FUNC(getopt, argc, argv, optstring);
+    tvm_optarg = optarg;
+    tvm_optind = optind;
+    tvm_opterr = opterr;
+    tvm_optopt = optopt;
+    pthread_mutex_unlock(&getopt_lock);
+    return r;
+}
+
+int getopt_long(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
+{
+    if (!main_task)
+        return CALL_FUNC(getopt_long, argc, argv, optstring, longopts, longindex);
+    pthread_mutex_lock(&getopt_lock);
+    optarg = tvm_optarg;
+    optind = tvm_optind;
+    opterr = tvm_opterr;
+    optopt = tvm_optopt;
+    int r = CALL_FUNC(getopt_long, argc, argv, optstring, longopts, longindex);
+    tvm_optarg = optarg;
+    tvm_optind = optind;
+    tvm_opterr = opterr;
+    tvm_optopt = optopt;
+    pthread_mutex_unlock(&getopt_lock);
+    return r;
+}
+
+int getopt_long_only(int argc, char * const argv[], const char *optstring, const struct option *longopts, int *longindex)
+{
+    if (!main_task)
+        return CALL_FUNC(getopt_long_only, argc, argv, optstring, longopts, longindex);
+    
+    pthread_mutex_lock(&getopt_lock);
+    optarg = tvm_optarg;
+    optind = tvm_optind;
+    opterr = tvm_opterr;
+    optopt = tvm_optopt;
+    int r = CALL_FUNC(getopt_long_only, argc, argv, optstring, longopts, longindex);
+    tvm_optarg = optarg;
+    tvm_optind = optind;
+    tvm_opterr = opterr;
+    tvm_optopt = optopt;
+    pthread_mutex_unlock(&getopt_lock);
+    return r;
 }

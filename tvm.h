@@ -31,3 +31,8 @@ char ***_tvm_environ();
 typedef int (*main_func_t)(int, char * const*, char * const*);
 void tvm_register_program(const char *pathname, main_func_t main_routine);
 
+extern __thread char *tvm_optarg;
+extern __thread int tvm_optind;
+extern __thread int tvm_opterr;
+extern __thread int tvm_optopt;
+
