@@ -807,13 +807,18 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
 
         if (pid == -1)
             *found = 1;
-        else if (pid == childt->tsk_pid)
+        else if (pid > 0 && pid == childt->tsk_pid)
+            *found = 1;
+        else if (pid < -1 && (-pid) == childt->tsk_pgid)
             *found = 1;
 
         if ((childt->tsk_state & TS_ZOMBIE) == 0)
             continue;
 
-        if (pid != -1 && childt->tsk_pid != pid)
+        if (pid > 0 && childt->tsk_pid != pid)
+            continue;
+
+        if (pid < -1 && (-pid) != childt->tsk_pgid)
             continue;
         
         break;
@@ -2159,12 +2164,23 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
     struct task *zombiet = NULL;
     int found;
 
+    // 0 is current pgid (which is marked in pid as `-pgid`)
+    if (pid == 0) {
+        task_lock(current);
+        pid = -(current->tsk_pgid);
+        task_unlock(current);
+    }
+
     pthread_mutex_lock(&current->tsk_wait_lock);
     while (!(zombiet = task_next_zombie_child(current, pid, &found))) {
         if (!found) {
             pthread_mutex_unlock(&current->tsk_wait_lock);
             errno = ECHILD;
             return -1;
+        }
+        if (options & WNOHANG) {
+            pthread_mutex_unlock(&current->tsk_wait_lock);
+            return 0;
         }
         pthread_cond_wait(&current->tsk_wait_cond, &current->tsk_wait_lock);
     }

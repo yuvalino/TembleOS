@@ -68,6 +68,46 @@ TEST(ProcExit) {
     printf("done\n");
 }
 
+TEST(ProcWNOHANG) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        usleep(100000);
+        _exit(0);
+    }
+    
+    ASSERT_EQ(0, waitpid(-1, NULL, WNOHANG));
+
+    usleep(200000);
+    
+    int s;
+    ASSERT_EQ(p, waitpid(-1, &s, WNOHANG));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(ProcWaitPgrp) {
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (0 != setpgid(0, 0))
+            _exit(1);
+        _exit(0);
+    }
+    
+    usleep(100000);
+
+    ASSERT_EQ(-1, waitpid(0, NULL, WNOHANG));
+    ASSERT_EQ(errno, ECHILD);
+
+    int s;
+    ASSERT_EQ(p, waitpid(-p, &s, WNOHANG));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 TEST(ProcRaise) {
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
