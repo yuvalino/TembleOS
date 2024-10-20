@@ -617,6 +617,78 @@ TEST(COWDeepCopy) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+TEST(COWDeepCopyMidBufferUnaligned)
+{
+    char *ptr = malloc(0x69);
+    ASSERT_NEQ(NULL, ptr);
+
+    cow_deep.val = 69;
+    cow_deep.ptr = ptr + 5;
+    int i;
+    for (i = 0; i < 10; i++)
+        ptr[i] = 'A'+i;
+    ptr[i] = 0;
+    ASSERT_EQ(0, strcmp(cow_deep.ptr, "FGHIJ"));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (cow_deep.ptr == NULL)
+            _exit(1);
+        
+        usleep(100000);
+        
+        if (0 != strcmp(cow_deep.ptr, "FGHIJ"))
+            _exit(2);
+        
+        _exit(0);
+    }
+
+    for (i = 0; i < 10; i++)
+        ptr[i] = '0' + i;
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(COWDeepCopyInStack)
+{
+    char *ptr = malloc(0x69);
+    int i;
+    for (i = 0; i < 10; i++)
+        ptr[i] = 'A'+i;
+    ptr[i] = 0;
+
+    ptr += 5;
+    ASSERT_EQ(0, strcmp(ptr, "FGHIJ"));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        if (ptr == NULL)
+            _exit(1);
+        
+        usleep(100000);
+        
+        if (0 != strcmp(ptr, "FGHIJ"))
+            _exit(2);
+        
+        _exit(0);
+    }
+
+    for (i = 5; i < 10; i++)
+        ptr[i] = '0' + i;
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 
 extern char **environ;
 
