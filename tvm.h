@@ -14,6 +14,7 @@
 #define COW_IMPL_INIT(Type, Name, InitExpr) __thread Type Name; _COW_REG_INIT(Name, InitExpr, 1)
 #define COW_IMPL(Type, Name) __thread Type Name; _COW_REG(Name, NULL, 1)
 #define COW_IMPL_ARRAY(Type, Name, Size) __thread Type Name [Size]; _COW_REG(Name, NULL, 1)
+#define COW_IMPL_ARRAY_MD(Type, Name, Size) __thread Type Name Size; _COW_REG(Name, NULL, 1)
 
 #define COW_IMPL_INIT_SHALLOW(Type, Name, InitExpr) __thread Type Name; _COW_REG_INIT(Name, InitExpr, 0)
 #define COW_IMPL_SHALLOW(Type, Name) __thread Type Name; _COW_REG(Name, NULL, 0)

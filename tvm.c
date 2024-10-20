@@ -1132,55 +1132,120 @@ static int is_valid_ptr(void *ptr)
     siglongjmp(ptrchk_retbuf, 1);
 }
 
-static void cow_deepcopy(void *buffer, size_t size)
+struct cow_deepcopy_ctx {
+    struct {
+        void *new;
+        void *old;
+        size_t size;
+    } *ptrs;
+    size_t count;
+};
+
+static void *cow_deepcopy_ctx_find(struct cow_deepcopy_ctx *dctx, void *needle)
+{
+    for (int i = 0; i < dctx->count; i++) {
+        uintptr_t off = ((uintptr_t) needle) - ((uintptr_t) dctx->ptrs[i].new);
+        if (off < dctx->ptrs[i].size)
+            return (void *) ((dctx->ptrs[i].new) + off);
+        
+        off = ((uintptr_t) needle) - ((uintptr_t) dctx->ptrs[i].old);
+        if (off < dctx->ptrs[i].size)
+            return (void *) ((dctx->ptrs[i].new) + off);
+    }
+
+    return NULL;
+}
+
+static void cow_deepcopy_ctx_add(struct cow_deepcopy_ctx *dctx, void *new, void *old, size_t size)
+{
+    dctx->ptrs = realloc(dctx->ptrs, sizeof(dctx->ptrs[0]) * (dctx->count + 1));
+    if (!dctx->ptrs)
+        panic("realloc ptrs count %zu", dctx->count);
+    
+    dctx->ptrs[dctx->count].new = new;
+    dctx->ptrs[dctx->count].old = old;
+    dctx->ptrs[dctx->count].size = size;
+    dctx->count++;
+}
+
+static int heap_offset(uintptr_t *p)
+{
+    for (int i = 0; i < (0x1000 / sizeof(void *)); i++)
+    {
+        if (!is_valid_ptr(p - i))
+            break;
+        
+        if (p[-i] == MALLOC_MAGIC)
+            return i * sizeof(uintptr_t);
+    }
+
+    return -1;
+}
+
+static void cow_deepcopy(void *buffer, size_t size, struct cow_deepcopy_ctx *dctx)
 {
     uintptr_t **end = (uintptr_t **) (((char *) buffer) + size);
 
-    // TODO ensure malloc always zeroes out memory?
+    for (uintptr_t **p = (uintptr_t **)buffer; (p+1) <= end; p++) {
+        // fight circular dependency!
+        uintptr_t *cached = (uintptr_t *) cow_deepcopy_ctx_find(dctx, (void *)*p);
+        if (cached) {
+            *p = cached;
+            continue;
+        }
 
-    for (uintptr_t **p = (uintptr_t **)buffer; p < end; p++) {
-        uintptr_t *pp = (*p)-1;
-        if (!is_valid_ptr((void *) pp))
+        int heapoff = heap_offset(*p);
+        if (-1 == heapoff)
             continue;
 
-        if (*pp != MALLOC_MAGIC)
-            continue;
-
-        size_t heap_size = malloc_usable_size((void *) pp);
+        void *p_heapbase = (void *) ((*p) - (heapoff / sizeof(uintptr_t)));
+        size_t heap_size = malloc_usable_size(p_heapbase);
         if (!heap_size)
             continue;
 
         uintptr_t *newptr = CALL_FUNC(malloc, heap_size);
         if (!newptr)
             panic("newptr = malloc(0x%zx)", heap_size);
-        *p = (newptr+1);
-        memcpy(newptr, pp, heap_size);
-        cow_deepcopy(newptr+1, heap_size-sizeof(uintptr_t));
+
+        cow_deepcopy_ctx_add(dctx, (void *) newptr, p_heapbase, heap_size);
+        *p = newptr + (heapoff / sizeof(uintptr_t));
+        memcpy(newptr, p_heapbase, heap_size);
+        cow_deepcopy(newptr+1, heap_size-sizeof(uintptr_t), dctx);
     }
 }
 
 static int cow_set_thread_ptrs(void **data)
 {
     struct cow_variable_t *cow;
-    
-    // TODO deepcopy circular dependency
+    struct cow_deepcopy_ctx dctx = {0};
 
+    void **d = data;
     list_for_each_entry(cow, &cow_variables, list) {
-        if (*data == NULL) {
+        if (*d == NULL) {
+            free(dctx.ptrs);
             return 1;
         }
 
-        memcpy(cow->getptr_fn(), *data, cow->size);
-
-        if (cow->flags & COW_DEEPCOPY)
-            cow_deepcopy(cow->getptr_fn(), cow->size);
+        void *ptr = cow->getptr_fn();
+        memcpy(ptr, *d, cow->size);
+        cow_deepcopy_ctx_add(&dctx, ptr, *d, cow->size);
         
-        data++;
+        d++;
     }
 
-    if (*data != NULL)
+    // deep copy on a second pass after the dctx is built
+    d = data;
+    list_for_each_entry(cow, &cow_variables, list) {
+        if (cow->flags & COW_DEEPCOPY)
+            cow_deepcopy(cow->getptr_fn(), cow->size, &dctx);
+        d++;
+    }
+
+    free(dctx.ptrs);
+
+    if (*d != NULL)
         return 2;
-    
+
     return 0;
 }
 
