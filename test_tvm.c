@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <sys/select.h>
 #include <poll.h>
+#include <pty.h>
 
 #include "tvm.h"
 
@@ -835,6 +836,149 @@ TEST(ExecArgs) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+char *ptsname(int fd);
+
+TEST(TTYBasic) {
+    int master, slave;
+	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    ASSERT_EQ(1, isatty(master));
+    ASSERT_EQ(1, isatty(slave));
+
+    ASSERT_NEQ(NULL, ttyname(master));
+    ASSERT_EQ(0, strcmp(ttyname(master), "/dev/ptmx"));
+
+    ASSERT_NEQ(NULL, ttyname(slave));
+    ASSERT_EQ(0, strncmp(ttyname(slave), "/tvm/pts/", 9));
+    ASSERT_EQ(0, strncmp(ptsname(master), "/tvm/pts/", 9));
+    ASSERT_EQ(0, strcmp(ptsname(master), ttyname(slave)));
+}
+
+TEST(TTYCloseMasterFork) {
+    int master, slave;
+	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    ASSERT_EQ(1, isatty(slave));
+    ASSERT_EQ(0, strncmp(ttyname(slave), "/tvm/pts/", 9));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+    if (!p) {
+        ASSERT_EQ(1, isatty(slave));
+        ASSERT_EQ(0, close(master));
+        ASSERT_EQ(1, isatty(slave));
+        exit(0);
+    }
+    ASSERT_EQ(p, wait(NULL));
+    
+    ASSERT_EQ(0, close(master));
+    ASSERT_EQ(NULL, ttyname(slave));
+    ASSERT_EQ(0, isatty(slave));
+}
+
+TEST(TTYCloseMasterDup2) {
+    int master, slave;
+	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    
+    int master2 = dup(master);
+    ASSERT_NEQ(master2, -1);
+    ASSERT_EQ(master, dup2(slave, master));
+    ASSERT_EQ(1, isatty(master));
+    ASSERT_EQ(master2, dup2(master, master2));
+    ASSERT_EQ(0, isatty(master));
+}
+
+TEST(TTYCloseSlave) {
+    int master, slave;
+	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+    ASSERT_EQ(1, isatty(master));
+    ASSERT_EQ(0, strncmp(ptsname(master), "/tvm/pts/", 9));
+
+    ASSERT_EQ(0, close(slave));
+    ASSERT_EQ(1, isatty(master));
+    ASSERT_EQ(0, strncmp(ptsname(master), "/tvm/pts/", 9));
+
+    ASSERT_NEQ(-1, open(ptsname(master), O_RDWR | O_NOCTTY));
+}
+
+static COW_IMPL_INIT(int, got_sig, 0);
+static void sighup_handler(int signo) {
+    got_sig++;
+}
+
+TEST(TTYDetachCloseMaster) {
+    int master, slave;
+	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+
+    struct sigaction act = { .sa_handler = sighup_handler };
+
+    pid_t p = fork();
+    ASSERT_NEQ(-1, p);
+
+    if (!p) {
+        ASSERT_EQ(0, sigaction(SIGHUP, &act, NULL));
+        ASSERT_EQ(0, close(master));
+        ASSERT_EQ(getpid(), setsid());
+        ASSERT_EQ(0, ioctl(slave, TIOCSCTTY, 0));
+
+        usleep(200000);
+        exit(got_sig-1);
+    }
+
+    usleep(100000);
+
+    ASSERT_EQ(0, close(master));
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(TTYDetachTIOCNOTTY) {
+    int master, slave;
+	ASSERT_EQ(0, openpty(&master, &slave, NULL, NULL, NULL));
+
+    struct sigaction act = { .sa_handler = sighup_handler };
+
+    pid_t p = fork();
+    ASSERT_NEQ(-1, p);
+
+    if (!p) {
+        ASSERT_EQ(0, sigaction(SIGHUP, &act, NULL));
+        ASSERT_EQ(0, close(master));
+        ASSERT_EQ(getpid(), setsid());
+        ASSERT_EQ(0, ioctl(slave, TIOCSCTTY, 0));
+
+        pid_t p2 = fork();
+        ASSERT_NEQ(-1, p2);
+
+        if (!p2) {
+            usleep(200000);
+            exit(got_sig-1);
+        }
+
+        ASSERT_EQ(0, setpgid(p2, p2));
+        ASSERT_EQ(0, tcsetpgrp(slave, p2));
+
+        usleep(100000);
+
+        ASSERT_EQ(0, ioctl(slave, TIOCNOTTY, 0));
+
+        int s;
+        ASSERT_EQ(p2, wait(&s));
+        ASSERT_EQ(WIFEXITED(s), 1);
+        ASSERT_EQ(WEXITSTATUS(s), 0);
+
+        exit(got_sig);
+    }
+
+    usleep(100000);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
 //////////
 //// Framework
 //////////
@@ -1086,7 +1230,7 @@ int main(int argc, char **argv)
             verbose++;
         }
         else if (c == 'k') {
-            test_names = realloc(test_names, test_names_s+1);
+            test_names = realloc(test_names, sizeof(char *) * (test_names_s+1));
             if (!test_names) {
                 fprintf(stderr, "out of memory\n");
                 return 1;

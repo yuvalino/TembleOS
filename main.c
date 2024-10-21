@@ -72,6 +72,7 @@ int main(int argc, char **argv)
     printf("Hello, World!\n");
     char *nargv[] = {
         argv[0],
+        //"-vvvvvv",
         "-F",
         "-E",
         NULL

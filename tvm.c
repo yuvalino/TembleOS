@@ -28,6 +28,7 @@
 #include <pty.h>
 #include <malloc.h>
 #include <getopt.h>
+#include <grp.h>
 
 #include "tvm.h"
 
@@ -213,11 +214,14 @@ DECL_FUNC(select);
 DECL_FUNC(poll);
 DECL_FUNC(fcntl);
 DECL_FUNC(ftruncate);
+DECL_FUNC(stat);
 DECL_FUNC(fstat);
 DECL_FUNC(fstatat);
 DECL_FUNC(faccessat);
+DECL_FUNC(chmod);
 DECL_FUNC(fchmod);
 DECL_FUNC(fchmodat);
+DECL_FUNC(chown);
 DECL_FUNC(fchown);
 DECL_FUNC(fchownat);
 DECL_FUNC(flock);
@@ -297,6 +301,8 @@ DECL_FUNC(tcsetpgrp);
 DECL_FUNC(isatty);
 DECL_FUNC(ttyname);
 DECL_FUNC(ttyname_r);
+DECL_FUNC(ptsname);
+DECL_FUNC(ptsname_r);
 
 DECL_FUNC(tcgetattr);
 DECL_FUNC(tcsetattr);
@@ -346,6 +352,23 @@ static int mkwstatus(int is_exit, int status_or_signal)
     }
 
     return __W_EXITCODE(0, status_or_signal);
+}
+
+static int intparse(const char *s, long long *out, int base)
+{
+    char *endp;
+
+    errno = 0;
+    long long r = strtoll(s, &endp, base);
+    if (0 != errno)
+        return -1;
+    
+    // not entire string is valid
+    if (*endp)
+        return -1;
+    
+    *out = r;
+    return 0;
 }
 
 /////////////
@@ -527,6 +550,17 @@ static char **findenv(char **env, const char *name, size_t name_len)
 }
 
 /////////////
+// Declarations
+/////////////
+
+struct fops;
+struct task;
+
+struct fops *fops_for_fd_locked(struct task *t, int fd);
+int fops_fdflag(struct fops *fops);
+int fops_dup(struct fops *fops, int oldfd, int newfd);
+
+/////////////
 // Task
 /////////////
 
@@ -534,6 +568,10 @@ static char **findenv(char **env, const char *name, size_t name_len)
 #define MAX_SIGNALS 32
 
 #define TS_ZOMBIE  0x1
+#define TS_CTTY    0x2
+
+#define TFD_MASK 0x0F000000
+#define TFD_TTY  0x01000000
 
 struct pthread_entry {
     struct list_head ptl_entry;
@@ -550,8 +588,7 @@ struct pthread_entry *make_pthread_entry(pthread_t t)
     return pentry;
 }
 
-struct task
-{
+struct task {
     struct list_head tsk_list;
     struct task *tsk_parent;
     unsigned tsk_refcount;
@@ -584,6 +621,45 @@ static void task_lock(struct task *t)
 static void task_unlock(struct task *t)
 {
     pthread_mutex_unlock(&t->tsk_lock);
+}
+
+static int t_fd(int fd)
+{
+    if (!main_task)
+        return fd;
+    
+    if (!current)
+        panic("t_fd");
+    
+    if (fd < 0 || fd >= MAX_FILES)
+        return -1;
+
+    if (current->tsk_fd[fd] >= 0)
+        return current->tsk_fd[fd] & (~TFD_MASK);
+    return current->tsk_fd[fd];
+}
+
+static int t_fdr(int fd, int lock)
+{
+    if (!main_task)
+        return fd;
+    
+    if (lock)
+        task_lock(current);
+    
+    if (fd >= 0) {
+        for (int i = 0; i < MAX_FILES; i++) {
+            if (fd == (current->tsk_fd[i] & ~TFD_MASK)) {
+                if (lock)
+                    task_unlock(current);
+                return i;
+            }
+        }
+    }
+
+    if (lock)
+        task_unlock(current);
+    return -1;
 }
 
 static struct task *taskalloc()
@@ -645,21 +721,30 @@ static struct task *taskalloc()
         t->tsk_pid = -1;
         t->tsk_sid = current->tsk_sid;
         t->tsk_pgid = current->tsk_pgid;
+        t->tsk_state = current->tsk_state & TS_CTTY;
 
         t->tsk_environ = copyenv(current->tsk_environ);
         if (!t->tsk_environ)
             panic("copyenv");
 
         for (int i = 0; i < MAX_FILES; i++) {
-            if (t->tsk_parent->tsk_fd[i] == -1)
+            if (t_fd(i) == -1)
                 continue;
             
-            t->tsk_fd[i] = CALL_FUNC(dup, t->tsk_parent->tsk_fd[i]);
-            if (t->tsk_fd[i] == -1)
+            int newfd = CALL_FUNC(dup, t_fd(i));
+            if (newfd == -1)
                 panic("taskalloc::dup");
+            t->tsk_fd[i] = newfd;
+            
+            struct fops *fops = fops_for_fd_locked(current, i);
+            t->tsk_fd[i] |= fops_fdflag(fops);
+            if (0 != fops_dup(fops, t_fd(i), newfd)) {
+                CALL_FUNC(close, newfd);
+                panic("taskalloc::f_dup");
+            }
         }
         for (int i = 0; i < 3; i++) {
-            t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i], (i?"w":"r"));
+            t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i] & ~TFD_MASK, (i?"w":"r"));
             if (!t->tsk_f[i])
                 panic("taskalloc::fdopen");
         }
@@ -752,6 +837,28 @@ static int task_get_fd_locked(struct task *t, int min_fd)
     }
 
     return -1;
+}
+
+static int task_reserve_fd(struct task *t, int min_fd)
+{
+    task_lock(t);
+    int f = task_get_fd_locked(t, min_fd);
+    if (f != -1)
+        current->tsk_fd[f] = -2;
+    task_unlock(t);
+    return f;
+}
+
+static int task_set_fd(struct task *t, int f, int r)
+{
+    if (f < 0 || f >= MAX_FILES)
+        panic("f %d", f);
+    
+    task_lock(t);
+    t->tsk_fd[f] = r;
+    task_unlock(t);
+    
+    return r;
 }
 
 static int task_new_fd(struct task *t, int min_fd, int new_fd) {
@@ -904,20 +1011,6 @@ static void terminate_current_locked(int result)
     __builtin_unreachable();
 }
 
-static int t_fd(int fd)
-{
-    if (!main_task)
-        return fd;
-    
-    if (!current)
-        panic("t_fd");
-    
-    if (fd >= MAX_FILES)
-        return -1;
-
-    return current->tsk_fd[fd];
-}
-
 static FILE *t_f(FILE *f)
 {
     if (!main_task)
@@ -986,6 +1079,9 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
     if (!sigshutup) {
         INFO("signum=%d", signum);
+        if (signum == SIGSEGV) {
+            raise(SIGFPE);
+        }
     }
 
     if (!current)
@@ -1016,7 +1112,8 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     }
     if (whatdo == SAD_CONT) {
         task_unlock(current);
-        panic("signal_handler CONT"); // TODO what do we do
+        // TODO anything else we need to do?
+        return;
     }
     
     if ((act->sa_flags & SA_SIGINFO) == 0) {
@@ -1028,6 +1125,1101 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     void (*hand)(int, siginfo_t *, void *) = act->sa_sigaction;
     task_unlock(current);
     return hand(signum, siginfo, ucontext);
+}
+
+/////////////
+// Devices
+/////////////
+
+struct fops {
+    struct list_head list;
+
+    int f_fdflag; // TFD_*
+
+    int (*f_openchk)(const char *pathname);
+    int (*f_open)(const char *pathname, int flags, mode_t mode);
+    int (*f_dup)(int oldfd, int newfd);
+    int (*f_stat)(int fd, struct stat *st);
+    int (*f_chown)(int fd, uid_t owner, gid_t group);
+    int (*f_chmod)(int fd, mode_t mode);
+    int (*f_ioctl)(int fd, unsigned long request, void *arg);
+    ssize_t (*f_read)(int fd, void *buf, size_t count, int offset);
+    ssize_t (*f_write)(int fd, const void *buf, size_t count, int offset);
+    int (*f_closelocked)(int fd);
+};
+
+static LIST_HEAD(devices);
+#define REGISTER_DEV(Fops) __attribute__((constructor)) \
+    static void _tvm_dreg_ ## Fops () { list_add_tail(&((Fops).list), &devices); }
+
+int fops_open(const char *pathname, int flags, mode_t mode)
+{
+    struct fops *f;
+    
+    list_for_each_entry(f, &devices, list) {
+        if (f->f_openchk && f->f_open && f->f_openchk(pathname))
+            return f->f_open(pathname, flags, mode);
+    }
+
+    return -1;
+}
+
+int fops_fdflag(struct fops *fops)
+{
+    if (!fops)
+        return 0;
+    
+    return fops->f_fdflag;
+}
+
+int fops_dup(struct fops *fops, int oldfd, int newfd)
+{
+    if (!fops || !fops->f_dup)
+        return 0;
+    
+    return fops->f_dup(oldfd, newfd);
+}
+
+struct fops *fops_for_fd_locked(struct task *t, int fd)
+{
+    if (fd < 0 || fd >= MAX_FILES || t->tsk_fd[fd] < 0)
+        return NULL;
+    
+    struct fops *f;
+    list_for_each_entry(f, &devices, list) {
+        if (f->f_fdflag && (t->tsk_fd[fd] & f->f_fdflag))
+            return f;
+    }
+
+    return NULL;
+}
+
+struct fops *fops_for_fd(struct task *t, int fd) {
+    task_lock(current);
+    struct fops *f = fops_for_fd_locked(t, fd);
+    task_unlock(current);
+    return f;
+}
+
+struct fops *fops_for_stream(struct task *t, FILE *stream) {
+    task_lock(current);
+    struct fops *f = fops_for_fd_locked(t, t_fdr(fileno(stream), 0));
+    task_unlock(current);
+    return f;
+}
+
+struct fops *fops_for_pathname(const char *pathname)
+{
+    struct fops *f;
+    
+    list_for_each_entry(f, &devices, list) {
+        if (f->f_openchk && f->f_open && f->f_openchk(pathname))
+            return f;
+    }
+
+    return NULL;
+}
+
+struct fops *fops_for_open(const char *pathname)
+{
+    struct fops *f;
+    list_for_each_entry(f, &devices, list) {
+        if (f->f_openchk && f->f_openchk(pathname))
+            return f;
+    }
+
+    return NULL;
+}
+
+#define FOPS_PATH(Fops, Func, Pathname, ...) do { \
+        if (!(Fops -> Func)) { \
+            errno = ENOTSUP; \
+            return -1; \
+        } \
+        int __FD = open(pathname, O_RDONLY | O_NOCTTY); \
+        if (__FD == -1) \
+            return -1; \
+        int __R = (Fops -> Func)(t_fd(__FD), ##__VA_ARGS__); \
+        if (0 == __R) \
+            __R = close(__FD); \
+        else \
+            close(__R); \
+        return __R; \
+    } while (0)
+
+ssize_t fops_read(struct fops *fops, int fd, void *buf, size_t count)
+{
+    if (!fops->f_read) {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return fops->f_read(fd, buf, count, -1);
+}
+
+
+
+ssize_t fops_write(struct fops *fops, int fd, const void *buf, size_t count)
+{
+    if (!fops->f_write) {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    return fops->f_write(fd, buf, count, -1);
+}
+
+/////////////
+// PTY/TTY
+/////////////
+
+#define TTY_DIR "/tvm/pts"
+#define PTMX_FILE "/dev/ptmx"
+#define TTY_FILE "/dev/tty"
+
+#define TTM_MASTER 1
+#define TTM_SLAVE  2
+#define TTM_ALL    (TTM_MASTER | TTM_SLAVE)
+
+struct tty {
+    struct list_head t_list;
+    pthread_mutex_t t_lock;
+    unsigned t_refcnt;
+
+    pid_t t_sid;
+    pid_t t_pgid;
+
+    uid_t t_uid;
+    gid_t t_gid;
+    mode_t t_mode;
+
+    struct winsize t_winsize;
+    struct termios t_termios;
+#define t_iflag  t_termios.c_iflag
+#define t_oflag  t_termios.c_oflag
+#define t_cflag  t_termios.c_cflag
+#define t_lflag  t_termios.c_lflag
+#define t_cc     t_termios.c_cc
+#define t_ispeed t_termios.c_ispeed
+#define t_ospeed t_termios.c_ospeed
+
+    int t_mfd;
+    ino_t t_mfd_ino;
+    int t_sfd;
+    ino_t t_sfd_ino;
+
+    int t_col;
+};
+
+LIST_HEAD(ttys);
+pthread_mutex_t ttys_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static COW_IMPL_ARRAY(char, tty_name, PATH_MAX);
+static COW_IMPL_ARRAY(char, pts_name, PATH_MAX);
+
+static cc_t ttydefchars[NCCS] = {
+	CEOF, CEOL, CEOL, CERASE, CWERASE, CKILL, CREPRINT,
+	_POSIX_VDISABLE, CINTR, CQUIT, CSUSP, CDSUSP, CSTART, CSTOP, CLNEXT,
+	CDISCARD, CMIN, CTIME, CSTATUS, _POSIX_VDISABLE
+};
+
+static void tty_lock(struct tty *tt) { pthread_mutex_lock(&tt->t_lock); }
+static void tty_unlock(struct tty *tt) { pthread_mutex_unlock(&tt->t_lock); }
+
+static struct tty *ttyalloc()
+{
+    int ends[2] = {-1, -1};
+    
+    if (-1 == CALL_FUNC(socketpair, AF_UNIX, SOCK_STREAM, 0, ends))
+        return NULL;
+    
+    struct tty *tt = malloc(sizeof(*tt));
+    if (!tt) {
+        CALL_FUNC(close, ends[0]);
+        CALL_FUNC(close, ends[1]);
+        return NULL;
+    }
+
+    tt->t_mfd = ends[0];
+    tt->t_sfd = ends[1];
+
+    tt->t_sid = -1;
+    tt->t_pgid = -1;
+
+    tt->t_mode = S_IRUSR | S_IWUSR | S_IWGRP;
+    tt->t_uid = getuid();
+    struct group *grp = getgrnam("tty");
+    if (grp)
+        tt->t_gid = grp->gr_gid;
+    else
+        tt->t_gid = getgid();
+
+    memcpy(tt->t_termios.c_cc, ttydefchars, sizeof(ttydefchars));
+    tt->t_termios.c_iflag = TTYDEF_IFLAG;
+    tt->t_termios.c_oflag = TTYDEF_OFLAG;
+    tt->t_termios.c_lflag = TTYDEF_LFLAG;
+    tt->t_termios.c_cflag = TTYDEF_CFLAG;
+    tt->t_termios.c_ispeed = tt->t_termios.c_ospeed = TTYDEF_SPEED;
+    
+    struct stat st;
+    if (-1 == CALL_FUNC(fstat, tt->t_mfd, &st)) {
+        goto fail;
+    }
+    tt->t_mfd_ino = st.st_ino;
+
+    if (-1 == CALL_FUNC(fstat, tt->t_sfd, &st)) {
+        goto fail;
+    }
+    tt->t_sfd_ino = st.st_ino;
+
+    if (pthread_mutex_init(&tt->t_lock, NULL) != 0) {
+        goto fail;
+    }
+
+    tty_lock(tt);
+
+    pthread_mutex_lock(&ttys_lock);
+    list_add_tail(&tt->t_list, &ttys);
+    pthread_mutex_unlock(&ttys_lock);
+
+    return tt;
+
+fail:
+
+    CALL_FUNC(close, ends[0]);
+    CALL_FUNC(close, ends[1]);
+    free(tt);
+
+    return NULL;
+}
+
+static void ttydealloc(struct tty *tt)
+{
+    pthread_mutex_lock(&ttys_lock);
+    list_del(&tt->t_list);
+    pthread_mutex_unlock(&ttys_lock);
+
+    if (tt->t_mfd != -1)
+        CALL_FUNC(close, tt->t_mfd);
+    if (tt->t_sfd != -1)
+        CALL_FUNC(close, tt->t_sfd);
+
+    pthread_mutex_unlock(&tt->t_lock);
+    pthread_mutex_destroy(&tt->t_lock);
+
+    free(tt);
+}
+
+/**
+ * Locks
+ */
+static struct tty *tty_for_fd(int fd, int mode)
+{
+    struct stat st;
+    if (-1 == CALL_FUNC(fstat, fd, &st))
+        return NULL;
+
+    pthread_mutex_lock(&ttys_lock);
+    struct tty *tt;
+    list_for_each_entry(tt, &ttys, t_list) {
+        if (((mode & TTM_MASTER) && tt->t_mfd_ino == st.st_ino) || 
+            ((mode & TTM_SLAVE)  && tt->t_sfd_ino == st.st_ino)) {
+            tty_lock(tt);
+            pthread_mutex_unlock(&ttys_lock);
+            return tt;
+        }
+    }
+    pthread_mutex_unlock(&ttys_lock);
+
+    return NULL;
+}
+
+/**
+ * Returns 1 if local (tvm) tty, 0 if not.
+ */
+static int islocaltty(int fd)
+{
+    task_lock(current);
+
+    // make its in `tsk_fd` first
+    if (t_fd(fd) == -1)
+        return 0;
+
+    if (0 == (current->tsk_fd[fd] & TFD_TTY)) {
+        task_unlock(current);
+        return 0;
+    }
+
+    struct tty *tt = tty_for_fd(t_fd(fd), TTM_ALL);
+    if (!tt) {
+        task_unlock(current);
+        return 0;
+    }
+
+    tty_unlock(tt);
+    task_unlock(current);
+    return 1;
+}
+
+static int ttyop_openchk(const char *pathname) {
+    return (0 == strncmp(pathname, TTY_DIR "/", sizeof(TTY_DIR "/") - 1) || 0 == strcmp(pathname, TTY_FILE));
+}
+
+/**
+ * Returns locked.
+ */
+static struct tty *tty_for_path(const char *pathname) {
+    if (!(ttyop_openchk(pathname)))
+        return NULL;
+    
+    // Open the controlling TTY
+    if (0 == strcmp(pathname, TTY_FILE)) {
+        task_lock(current);
+        if (0 == (current->tsk_state & TS_CTTY)) {
+            task_unlock(current);
+            return NULL;
+        }
+
+        pthread_mutex_lock(&ttys_lock);
+        struct tty *tt;
+        list_for_each_entry(tt, &ttys, t_list) {
+            tty_lock(tt);
+            if (tt->t_sid == current->tsk_sid) {
+                pthread_mutex_unlock(&ttys_lock);
+                task_unlock(current);
+                return tt;
+            }
+            tty_unlock(tt);
+        }
+        pthread_mutex_unlock(&ttys_lock);
+
+        panic("TS_CTTY but no TTY found");
+    }
+
+    // Open some other TTY
+
+    long long n;
+    if (0 != intparse(pathname + sizeof(TTY_DIR "/") - 1, &n, 10))
+        return NULL;
+    
+    pthread_mutex_lock(&ttys_lock);
+    struct tty *tt;
+    list_for_each_entry(tt, &ttys, t_list) {
+        tty_lock(tt);
+        if (((int) n) == tt->t_mfd) {
+            pthread_mutex_unlock(&ttys_lock);
+            return tt;
+        }
+        tty_unlock(tt);
+    }
+    pthread_mutex_unlock(&ttys_lock);
+
+    return NULL;
+}
+
+static int ttyop_open(const char *pathname, int flags, mode_t mode)
+{
+    struct tty *tt = tty_for_path(pathname);
+    if (!tt) {
+        errno = ENOTTY;
+        return -1;
+    }
+    
+    // tt is locked
+
+    if (0 == (flags & O_NOCTTY)) {
+        task_lock(current);
+
+        // gotta have no terminal and be session leader
+        if (current->tsk_state & TS_CTTY || current->tsk_pid != current->tsk_sid) {
+            task_unlock(current);
+            flags |= O_NOCTTY;
+        }
+        else
+        {
+            // no stealing!
+            if (tt->t_sid != current->tsk_sid && tt->t_sid != -1) {
+                task_unlock(current);
+                errno = EIO;
+                return -1;
+            }
+
+            // tt is still locked in this case!
+        }
+    }
+
+    if (tt->t_sfd == -1)
+        panic("%s t_sfd invalid?", pathname);
+
+    int r_sfd = CALL_FUNC(dup, tt->t_sfd);
+
+    if (0 == (flags & O_NOCTTY)) {
+        if (-1 != r_sfd) {
+            current->tsk_state |= TS_CTTY;
+            tt->t_sid = current->tsk_sid;
+            tt->t_pgid = current->tsk_pgid;
+        }
+
+        task_unlock(current);
+    }
+
+    tty_unlock(tt);
+    return r_sfd;
+}
+
+static int ttyop_dup(int oldfd, int newfd) {
+    struct tty *tt = tty_for_fd(oldfd, TTM_MASTER);
+    if (!tt)
+        return 0;
+    
+    tt->t_refcnt++;
+    tty_unlock(tt);
+    return 0;
+}
+
+static int ttyop_stat(int fd, struct stat *st)
+{
+    struct tty *tt = tty_for_fd(fd, TTM_ALL);
+    if (!tt)
+        return -1;
+
+    if (!st) {
+        tty_unlock(tt);
+        return 0;
+    }
+
+    memset(st, 0, sizeof(*st));
+
+    st->st_ino = tt->t_mfd_ino;
+    st->st_uid = tt->t_uid;
+    st->st_gid = tt->t_gid;
+    st->st_mode = tt->t_mode;
+
+    tty_unlock(tt);
+    return 0;
+}
+
+static int ttyop_chmod(int fd, mode_t mode)
+{
+    struct tty *tt = tty_for_fd(fd, TTM_ALL);
+    if (!tt)
+        return -1;
+
+    tt->t_mode = mode;
+
+    tty_unlock(tt);
+    return 0;
+}
+
+static int ttyop_chown(int fd, uid_t owner, gid_t group)
+{
+    struct tty *tt = tty_for_fd(fd, TTM_ALL);
+    if (!tt)
+        return -1;
+
+    tt->t_uid =owner;
+    tt->t_gid = group;
+
+    tty_unlock(tt);
+    return 0;
+}
+
+static int ttyop_ioctl(int fd, unsigned long request, void *arg)
+{
+    int is_master = 1;
+    struct tty *tt = tty_for_fd(fd, TTM_MASTER);
+    if (!tt) {
+        tt = tty_for_fd(fd, TTM_SLAVE);
+        if (!tt) {
+            errno = ENOTTY;
+            return -1;
+        }
+        is_master = 0;
+    }
+    
+    pid_t pgid;
+    struct task *t;
+
+    int ret = -1;
+
+    switch (request) {
+        case TCGETS:
+            memcpy(arg, &tt->t_termios, sizeof(tt->t_termios));
+            ret = 0;
+            break;
+        
+        case TCSETS:
+        case TCSETSW:
+            memcpy(&tt->t_termios, arg, sizeof(tt->t_termios));
+            ret = 0;
+            break;
+        
+
+        case TIOCGWINSZ:
+            memcpy(arg, &tt->t_winsize, sizeof(tt->t_winsize));
+            ret = 0;
+            break;
+        
+        case TIOCSWINSZ:
+            memcpy(&tt->t_winsize, arg, sizeof(tt->t_winsize));
+            if (tt->t_sid == -1 || tt->t_pgid == -1) {
+                ret = 0;
+                break;
+            }
+            
+            pgid = tt->t_pgid;
+            tty_unlock(tt);
+            kill(-pgid, SIGWINCH);
+            tty_lock(tt);
+            ret = 0;
+            break;
+        
+        case TIOCSCTTY:
+            task_lock(current);
+            if ((current->tsk_state & TS_CTTY) ||
+                (current->tsk_sid != current->tsk_pid)) {
+                task_unlock(current);
+                errno = EINVAL;
+                break;
+            }
+
+            // we don't allow stealing ttys
+            if (tt->t_sid != -1 || 0 != (long)arg) {
+                task_unlock(current);
+                errno = EPERM;
+                break;
+            }
+
+            current->tsk_state |= TS_CTTY;
+            tt->t_sid = current->tsk_sid;
+            tt->t_pgid = current->tsk_pgid;
+            task_unlock(current);
+            ret = 0;
+            break;
+
+        case TIOCNOTTY:
+            task_lock(current);
+            if (current->tsk_sid != current->tsk_pid) {
+                current->tsk_state &= ~TS_CTTY;
+                task_unlock(current);
+                ret = 0;
+                break;
+            }
+            task_unlock(current);
+
+            pthread_mutex_lock(&tasks_lock);
+            list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
+                task_lock(t);
+                if (t->tsk_sid == tt->t_sid)
+                    t->tsk_state &= ~TS_CTTY;
+                task_unlock(t);
+            }
+            pthread_mutex_unlock(&tasks_lock);
+
+            pgid = tt->t_pgid;
+            tty_unlock(tt);
+            kill(-pgid, SIGHUP);
+            kill(-pgid, SIGCONT);
+            tty_lock(tt);
+            ret = 0;
+            break;
+
+        case TIOCGPGRP:
+            task_lock(current);
+            if (!is_master &&
+                (0 == (current->tsk_state & TS_CTTY) || tt->t_sid != current->tsk_sid)) {
+                task_unlock(current);
+                errno = ENOTTY;
+                break;
+            }
+            task_unlock(current);
+
+            *((pid_t *) arg) = tt->t_pgid;
+            ret = 0;
+            break;
+        
+        case TIOCSPGRP:
+            task_lock(current);
+            if (!is_master &&
+                (0 == (current->tsk_state & TS_CTTY) || tt->t_sid != current->tsk_sid)) {
+                task_unlock(current);
+                errno = ENOTTY;
+                break;
+            }
+            task_unlock(current);
+
+            pthread_mutex_lock(&tasks_lock);
+            list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
+                if (t->tsk_pgid == *((pid_t *)arg)) {
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&tasks_lock);
+
+            // group non-existed / empty
+            if (t == main_task && main_task->tsk_pgid != *((pid_t *) arg)) {
+                errno = -ESRCH;
+                break;
+            }
+
+            tt->t_pgid = *((pid_t *) arg);
+            ret = 0;
+            break;
+
+        case TIOCGSID:
+            task_lock(current);
+            if (!is_master &&
+                (0 == (current->tsk_state & TS_CTTY) || tt->t_sid != current->tsk_sid)) {
+                task_unlock(current);
+                errno = ENOTTY;
+                break;
+            }
+            task_unlock(current);
+
+            *((pid_t *) arg) = tt->t_sid;
+            ret = 0;
+            break;
+
+        default:
+            errno = ENOTSUP;
+    }
+
+    tty_unlock(tt);
+    return ret;
+}
+
+static ssize_t ttyop_read(int fd, void *buf, size_t count, int offset)
+{
+    if (offset != -1) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int is_master = 1;
+    struct tty *tt = tty_for_fd(fd, TTM_MASTER);
+    if (!tt) {
+        tt = tty_for_fd(fd, TTM_SLAVE);
+        if (!tt) {
+            errno = ENOTTY;
+            return -1;
+        }
+        is_master = 0;
+    }
+
+    // if (is_master) {
+    //     static int f = -1;
+    //     if (f == -1) {
+    //         unlink("/tmp/tty.read");
+    //         f = CALL_FUNC(open, "/tmp/tty.read", O_CREAT | O_WRONLY | O_TRUNC, 0777);
+    //     }
+    //     CALL_FUNC(write, f, buf, count);
+    // }
+
+    tty_unlock(tt);
+    return CALL_FUNC(read, fd, buf, count);
+}
+
+#define TTY_CHARMASK    0x000000ff      /* Character mask */
+
+#define E       0x00    /* Even parity. */
+#define O       0x80    /* Odd parity. */
+
+#define ALPHA   0x40    /* Alpha or underscore. */
+
+#define CCLASSMASK      0x3f
+#define CCLASS(c)       (char_type[c] & CCLASSMASK)
+
+#define SET(T, F)       (T) |= (F)
+#define CLR(T, F)       (T) &= ~(F)
+#define ISSET(T, F)     ((T) & (F))
+
+#define ORDINARY        0
+#define CONTROL         1
+#define BACKSPACE       2
+#define NEWLINE         3
+#define TAB             4
+#define VTAB            5
+#define RETURN          6
+
+#define BS      BACKSPACE
+#define CC      CONTROL
+#define CR      RETURN
+#define NA      ORDINARY | ALPHA
+#define NL      NEWLINE
+#define NO      ORDINARY
+#define TB      TAB
+#define VT      VTAB
+
+static u_char const char_type[] = {
+	E | CC, O | CC, O | CC, E | CC, O | CC, E | CC, E | CC, O | CC, /* nul - bel */
+	O | BS, E | TB, E | NL, O | CC, E | VT, O | CR, O | CC, E | CC, /* bs - si */
+	O | CC, E | CC, E | CC, O | CC, E | CC, O | CC, O | CC, E | CC, /* dle - etb */
+	E | CC, O | CC, O | CC, E | CC, O | CC, E | CC, E | CC, O | CC, /* can - us */
+	O | NO, E | NO, E | NO, O | NO, E | NO, O | NO, O | NO, E | NO, /* sp - ' */
+	E | NO, O | NO, O | NO, E | NO, O | NO, E | NO, E | NO, O | NO, /* ( - / */
+	E | NA, O | NA, O | NA, E | NA, O | NA, E | NA, E | NA, O | NA, /* 0 - 7 */
+	O | NA, E | NA, E | NO, O | NO, E | NO, O | NO, O | NO, E | NO, /* 8 - ? */
+	O | NO, E | NA, E | NA, O | NA, E | NA, O | NA, O | NA, E | NA, /* @ - G */
+	E | NA, O | NA, O | NA, E | NA, O | NA, E | NA, E | NA, O | NA, /* H - O */
+	E | NA, O | NA, O | NA, E | NA, O | NA, E | NA, E | NA, O | NA, /* P - W */
+	O | NA, E | NA, E | NA, O | NO, E | NO, O | NO, O | NO, O | NA, /* X - _ */
+	E | NO, O | NA, O | NA, E | NA, O | NA, E | NA, E | NA, O | NA, /* ` - g */
+	O | NA, E | NA, E | NA, O | NA, E | NA, O | NA, O | NA, E | NA, /* h - o */
+	O | NA, E | NA, E | NA, O | NA, E | NA, O | NA, O | NA, E | NA, /* p - w */
+	E | NA, O | NA, O | NA, E | NO, O | NO, E | NO, E | NO, O | CC, /* x - del */
+	/*
+	 * Meta chars; should be settable per character set;
+	 * for now, treat them all as normal characters.
+	 */
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+	NA, NA, NA, NA, NA, NA, NA, NA,
+};
+#undef  BS
+#undef  CC
+#undef  CR
+#undef  NA
+#undef  NL
+#undef  NO
+#undef  TB
+#undef  VT
+
+static int tty_putc(struct tty *tt, int fd, int c)
+{
+    // assumes fd is O_NONBLOCK
+
+    ssize_t ret = CALL_FUNC(write, fd, &c, 1);
+    if (ret == 1)
+        return 0;
+    if (ret == 0)
+        panic("what?");
+    if (errno != EWOULDBLOCK && errno != EAGAIN)
+        return -1;
+    
+    // would block, try with blocking
+    if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, 0))
+        return -1;
+    
+    tty_unlock(tt);
+    ret = CALL_FUNC(write, fd, &c, 1);
+    tty_lock(tt);
+
+    if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, O_NONBLOCK))
+        return -1;
+
+    if (ret == 0)
+        panic("what?");
+    if (ret == 1)
+        return 0;
+    return -1;
+}
+
+static int tty_output(struct tty *tt, int fd, int c)
+{
+    int col;
+
+    if (!ISSET(tt->t_oflag, OPOST)) {
+        if (ISSET(tt->t_lflag, FLUSHO))
+            return 0;
+        return tty_putc(tt, fd, c);
+    }
+
+    // expand tabs or smth
+
+    // if ONLCR is set, translate newline into "\r\n"
+    if (c == '\n' && ISSET(tt->t_oflag, ONLCR)) {
+		if (tty_putc(tt, fd, '\r'))
+			return -1;
+	}
+    // if OCRNL is set, translate "\r" into "\n"
+	else if (c == '\r' && ISSET(tt->t_oflag, OCRNL))
+		c = '\n';
+    // if ONOCR is set, don't transmit CRs when on column 0
+    else if (c == '\r' && ISSET(tt->t_oflag, ONOCR) && tt->t_col == 0)
+		return 0;
+
+    if (!ISSET(tt->t_lflag, FLUSHO) && tty_putc(tt, fd, c))
+		return -1;
+    
+    col = tt->t_col;
+	switch (CCLASS(c)) {
+	case BACKSPACE:
+		if (col > 0) {
+			--col;
+		}
+		break;
+	case CONTROL:
+		break;
+	case NEWLINE:
+	case RETURN:
+		col = 0;
+		break;
+	case ORDINARY:
+		++col;
+		break;
+	case TAB:
+		col = (col + 8) & ~7;
+		break;
+	}
+	tt->t_col = col;
+	return 0;
+}
+
+static ssize_t tty_output_buffer(struct tty *tt, int fd, const uint8_t *buf, size_t count)
+{
+    int fflags;
+    ssize_t ret = -1;
+
+    if (-1 == (fflags = CALL_FUNC(fcntl, fd, F_GETFL)))
+        return -1;
+
+    if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, O_NONBLOCK))
+        return -1;
+
+    size_t i;
+    for (i = 0; i < count; i++)
+        if (0 != tty_output(tt, fd, (int)buf[i]))
+            break;
+    
+    ret = i;
+
+    CALL_FUNC(fcntl, fd, F_SETFL, fflags);
+
+    return ret;
+}
+
+static void tty_echo(struct tty *tt, int c)
+{
+	if ((!ISSET(tt->t_lflag, ECHO) &&
+	    (c != '\n' || !ISSET(tt->t_lflag, ECHONL))) ||
+	    ISSET(tt->t_lflag, EXTPROC)) {
+		return;
+	}
+
+    int slave = CALL_FUNC(dup, tt->t_sfd);
+    if (-1 == slave)
+        return;
+    
+    if (-1 == CALL_FUNC(fcntl, slave, F_SETFL, O_NONBLOCK)) {
+        CALL_FUNC(close, slave);
+        return;
+    }
+
+	if (ISSET(tt->t_lflag, ECHOCTL) &&
+	    ((ISSET(c, TTY_CHARMASK) <= 037 && c != '\t' && c != '\n') ||
+	    ISSET(c, TTY_CHARMASK) == 0177)) {
+		(void)tty_output(tt, slave, '^');
+		CLR(c, ~TTY_CHARMASK);
+		if (c == 0177) {
+			c = '?';
+		} else {
+			c += 'A' - 1;
+		}
+	}
+
+	tty_output(tt, slave, c);
+    CALL_FUNC(close, slave);
+}
+
+static int tty_input(struct tty *tt, int fd, int c)
+{
+    if (ISSET(tt->t_iflag, ISTRIP))
+		CLR(c, 0x80);
+    
+    if (!ISSET(tt->t_lflag, EXTPROC)) {
+        // Signals
+        if (ISSET(tt->t_lflag, ISIG)) {
+            if (CCEQ(tt->t_cc[VINTR], c) || CCEQ(tt->t_cc[VQUIT], c) || CCEQ(tt->t_cc[VSUSP], c)) {
+                tty_echo(tt, c);
+                int pgid = tt->t_pgid;
+                int sig = CCEQ(tt->t_cc[VINTR], c) ? SIGINT : (CCEQ(tt->t_cc[VQUIT], c) ? SIGQUIT : SIGTSTP);
+                tty_unlock(tt);
+                kill(-pgid, sig); // TODO check TS_CTTY
+                tty_lock(tt);
+                return 0;
+            }
+        }
+
+        // IGNCR, ICRNL, & INLCR
+		if (c == '\r') {
+			if (ISSET(tt->t_iflag, IGNCR))
+				return 0;
+			if (ISSET(tt->t_iflag, ICRNL))
+				c = '\n';
+		} else if (c == '\n' && ISSET(tt->t_iflag, INLCR))
+			c = '\r';
+        
+    }
+
+    return tty_putc(tt, fd, c);
+}
+
+static ssize_t tty_input_buffer(struct tty *tt, int fd, const uint8_t *buf, size_t count)
+{
+    int fflags;
+    ssize_t ret = -1;
+
+    if (-1 == (fflags = CALL_FUNC(fcntl, fd, F_GETFL)))
+        return -1;
+
+    if (-1 == CALL_FUNC(fcntl, fd, F_SETFL, O_NONBLOCK))
+        return -1;
+
+    size_t i;
+    for (i = 0; i < count; i++)
+        if (0 != tty_input(tt, fd, (int)buf[i]))
+            break;
+    
+    ret = i;
+
+    CALL_FUNC(fcntl, fd, F_SETFL, fflags);
+
+    return ret;
+}
+
+static ssize_t ttyop_write(int fd, const void *buf, size_t count, int offset)
+{
+    if (offset != -1) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int is_master = 1;
+    struct tty *tt = tty_for_fd(fd, TTM_MASTER);
+    if (!tt) {
+        tt = tty_for_fd(fd, TTM_SLAVE);
+        if (!tt) {
+            errno = ENOTTY;
+            return -1;
+        }
+        is_master = 0;
+    }
+
+    // if (is_master) {
+    //     static int f = -1;
+    //     if (f == -1) {
+    //         unlink("/tmp/tty.write");
+    //         f = CALL_FUNC(open, "/tmp/tty.write", O_CREAT | O_WRONLY | O_TRUNC, 0777);
+    //         if (f == -1)
+    //             CALL_FUNC(printf, "ERR %d\n", errno);
+    //     }
+    //     CALL_FUNC(write, f, buf, count);
+    // }
+
+    ssize_t ret;
+    if (is_master)
+        ret = tty_input_buffer(tt, fd, buf, count);
+    else
+        ret = tty_output_buffer(tt, fd, buf, count);
+    tty_unlock(tt);
+    return ret;
+}
+
+
+static int ttyop_closelocked(int fd) {
+    struct tty *tt = tty_for_fd(fd, TTM_MASTER);
+    if (!tt)
+        return 0;
+
+    tt->t_refcnt--;
+    if (tt->t_refcnt) {
+        tty_unlock(tt);
+        return 0;
+    }
+
+    // Disassociate the entire session
+    struct task *signaltask = NULL;
+    if (tt->t_sid != -1) {
+        pthread_mutex_lock(&tasks_lock);
+        struct task *t;
+        list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
+            task_lock(t);
+            if (t->tsk_sid == tt->t_sid)
+                t->tsk_state &= ~TS_CTTY;
+            if (t->tsk_pid == tt->t_sid)
+                signaltask = t;
+            else
+                task_unlock(t);
+        }
+        pthread_mutex_unlock(&tasks_lock);
+    }
+
+    ttydealloc(tt);
+
+    if (signaltask) {
+        pid_t p = signaltask->tsk_pid;
+        task_unlock(signaltask);
+        kill(p, SIGHUP);
+        kill(p, SIGCONT);
+    }
+
+    return 0;
+}
+
+static struct fops ttyops = {
+    .f_fdflag = TFD_TTY,
+
+    .f_openchk = ttyop_openchk,
+    .f_open = ttyop_open,
+    .f_dup = ttyop_dup,
+    .f_stat = ttyop_stat,
+    .f_chmod = ttyop_chmod,
+    .f_chown = ttyop_chown,
+    .f_ioctl = ttyop_ioctl,
+    .f_read = ttyop_read,
+    .f_write = ttyop_write,
+    .f_closelocked = ttyop_closelocked,
+};
+REGISTER_DEV(ttyops);
+
+static int ptm_open()
+{
+    struct tty *tt = ttyalloc();
+    if (!tt) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    // tt is locked
+
+    int mfd = CALL_FUNC(dup, tt->t_mfd);
+    if (-1 == mfd) {
+        ttydealloc(tt);
+        return -1;
+    }
+
+    tt->t_refcnt++;
+    tty_unlock(tt);
+    return mfd;
+}
+
+static int tty_slavename(int fd, char *buf, size_t buflen)
+{
+    struct tty *tt = tty_for_fd(fd, TTM_ALL);
+    if (!tt)
+        return ENOTTY;
+
+    if (tt->t_mfd == -1) {
+        tty_unlock(tt);
+        return EINVAL;
+    }
+
+    snprintf(buf, buflen, TTY_DIR "/%d", tt->t_mfd);
+    tty_unlock(tt);
+    return 0;
 }
 
 /////////////
@@ -1638,6 +2830,7 @@ static void __panic(const char *msg, const char *file, int line)
     CALL_FUNC(fprintf, stderr, " host pid: %d\n", CALL_FUNC(getpid));
     CALL_FUNC(fprintf, stderr, " current: %p\n", current);
     CALL_FUNC(fprintf, stderr, " main_task: %p\n", main_task);
+    CALL_FUNC(fprintf, stderr, " errno: %d (%s)\n", errno, strerror(errno));
     CALL_FUNC(fprintf, stderr, "\n");
 
     CALL_FUNC(exit, 255);
@@ -1651,10 +2844,36 @@ FILE *fdopen(int fd, const char *mode)
 { return CALL_FUNC(fdopen, t_fd(fd), mode); }
 
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
-{ return CALL_FUNC(fwrite, ptr, size, nmemb, t_f(stream)); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_stream(current, stream)))
+        return CALL_FUNC(fwrite, ptr, size, nmemb, t_f(stream));
+    
+    if (!size)
+        return 0;
+    
+    ssize_t r = fops_write(fops, fileno(stream), ptr, size * nmemb);
+    if (r < 0)
+        r = 0;
+    
+    return r / size;
+}
 
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
-{ return CALL_FUNC(fread, ptr, size, nmemb, t_f(stream)); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_stream(current, stream)))
+        return CALL_FUNC(fread, ptr, size, nmemb, t_f(stream));
+    
+    if (!size)
+        return 0;
+    
+    ssize_t r = fops_read(fops, fileno(stream), ptr, size * nmemb);
+    if (r < 0)
+        r = 0;
+    
+    return r / size;
+}
 
 int fseek(FILE *stream, long offset, int whence)
 { return CALL_FUNC(fseek, t_f(stream), offset, whence); }
@@ -1678,35 +2897,93 @@ int setvbuf(FILE *stream, char *buf, int mode, size_t size)
 { return CALL_FUNC(setvbuf, t_f(stream), buf, mode, size); }
 
 int fputc(int c, FILE *stream)
-{ return CALL_FUNC(fputc, c, t_f(stream)); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_stream(current, stream)))
+        return CALL_FUNC(fputc, c, t_f(stream));
+    
+    if (1 == fops_write(fops, fileno(stream), &c, 1))
+        return c;
+    return EOF;
+}
 
 int fputs(const char *s, FILE *stream)
-{ return CALL_FUNC(fputs, s, t_f(stream)); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_stream(current, stream)))
+        return CALL_FUNC(fputs, s, t_f(stream));
+    
+    ssize_t r = fops_write(fops, fileno(stream), s, strlen(s));
+    if (r >= 0)
+        return r;
+    return EOF;
+}
 
 int putc(int c, FILE *stream)
-{ return CALL_FUNC(putc, c, t_f(stream)); }
+{ return fputc(c, stream); }
 
 int putchar(int c)
-{ return CALL_FUNC(fputc, c, t_f(stdout)); }
+{ return fputc(c, stdout); }
 
 int puts(const char *s)
 {
-    if (EOF == CALL_FUNC(fputs, s, t_f(stdout)))
+    if (EOF == fputs(s, stdout))
         return EOF;
-    return CALL_FUNC(fputc, '\n', t_f(stdout));
+    return fputc('\n', stdout);
 }
 
 int fgetc(FILE *stream)
-{ return CALL_FUNC(fgetc, t_f(stream)); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_stream(current, stream)))
+        return CALL_FUNC(fgetc, t_f(stream));
+    
+    char c;
+    if (1 == fops_read(fops, fileno(stream), &c, 1))
+        return (int)c;
+    return EOF;
+}
 
 char *fgets(char *s, int size, FILE *stream)
-{ return CALL_FUNC(fgets, s, size, t_f(stream)); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_stream(current, stream)))
+        return  CALL_FUNC(fgets, s, size, t_f(stream));
+    
+    if (size <= 0)
+        return NULL;
+    if (size == 1) {
+        s[0] = 0;
+        return s;
+    }
+    
+    int err = 0;
+    int i;
+    char c = 0;
+    for (i = 0; i < (size - 1) && c != '\n'; i++)
+    {
+        ssize_t r = fops_read(fops, fileno(stream), &c, 1);
+        if (r == -1)
+            err = 1;
+        if (1 != r)
+            break;
+        
+        s[i] = c;
+    }
+    
+
+    if (i == 0 && err)
+        return NULL;
+    
+    s[i] = 0;
+    return s;
+}
 
 int getc(FILE *stream)
-{ return CALL_FUNC(getc, t_f(stream)); }
+{ return fgetc(t_f(stream)); }
 
 int getchar(void)
-{ return CALL_FUNC(getc, t_f(stdin)); }
+{ return fgetc(t_f(stdin)); }
 
 int ungetc(int c, FILE *stream)
 { return CALL_FUNC(ungetc, c, t_f(stream)); }
@@ -1730,7 +3007,7 @@ int printf(const char *format, ...)
     va_list arg;
     int done;
     va_start (arg, format);
-    done = CALL_FUNC(vfprintf, t_f(stdout), format, arg);
+    done = vfprintf(stdout, format, arg);
     va_end (arg);
     return done;
 }
@@ -1740,7 +3017,7 @@ int fprintf(FILE *stream, const char *format, ...)
     va_list arg;
     int done;
     va_start (arg, format);
-    done = CALL_FUNC(vfprintf, t_f(stream), format, arg);
+    done = vfprintf(stream, format, arg);
     va_end (arg);
     return done;
 }
@@ -1750,19 +3027,47 @@ int dprintf(int fd, const char *format, ...)
     va_list arg;
     int done;
     va_start (arg, format);
-    done = CALL_FUNC(vdprintf, t_fd(fd), format, arg);
+    done = vdprintf(fd, format, arg);
     va_end (arg);
     return done;
 }
 
 int vprintf(const char *format, va_list ap)
-{ return CALL_FUNC(vfprintf, t_f(stdout), format, ap); }
+{ return vfprintf(stdout, format, ap); }
 
 int vfprintf(FILE *stream, const char *format, va_list ap)
-{ return CALL_FUNC(vfprintf, t_f(stream), format, ap); }
+{
+    struct fops *fops;
+    int fd = t_fdr(fileno(stream), 1);
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(vfprintf, t_f(stream), format, ap);
+    
+    return vdprintf(fd, format, ap);
+}
 
 int vdprintf(int fd, const char *format, va_list ap)
-{ return CALL_FUNC(vdprintf, t_fd(fd), format, ap); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(vdprintf, t_fd(fd), format, ap);
+    
+    va_list ap2;
+    va_copy(ap2, ap);
+    int size = vsnprintf(NULL, 0, format, ap2);
+    va_end(ap2);
+
+    if (size < 0)
+        return size;
+    
+    char *s = malloc(size+1);
+    if (!s)
+        return -1;
+    
+    int wsize = vsnprintf(s, size, format, ap);    
+    wsize = (int)fops_write(fops, t_fd(fd), s, wsize);
+    free(s);
+    return wsize;
+}
 
 int scanf(const char *format, ...)
 {
@@ -1791,30 +3096,48 @@ int vfscanf(FILE *stream, const char *format, va_list ap)
 { return CALL_FUNC(vfscanf, t_f(stream), format, ap); }
 
 void perror(const char *s)
-{ fprintf(t_f(stderr), "%s: %s\n", s, strerror(errno)); }
+{
+    if (!main_task)
+        return CALL_FUNC(perror, s);
+    
+    fprintf(t_f(stderr), "%s: %s\n", s, strerror(errno));
+}
 
 int open(const char *pathname, int flags, ...)
 {
+    int f = task_reserve_fd(current, 0);
+    if (f == -1) {
+        errno = EMFILE;
+        return -1;
+    }
+
+    struct fops *fops = fops_for_open(pathname);
+
     int r;
     if (__OPEN_NEEDS_MODE(flags)) {
         va_list ap;
         va_start(ap, flags);
         mode_t m = va_arg(ap, mode_t);
         va_end(ap);
-        r = CALL_FUNC(open, pathname, flags, m);
+        
+        if (fops && fops->f_open)
+            r = fops->f_open(pathname, flags, m) | fops->f_fdflag;
+        else
+            r = CALL_FUNC(open, pathname, flags, m);
     }
-    else
-        r = CALL_FUNC(open, pathname, flags);
+    else {
+        if (fops && fops->f_open)
+            r = fops->f_open(pathname, flags, 0) | fops->f_fdflag;
+        else
+            r = CALL_FUNC(open, pathname, flags);
+    }
     
     if (r == -1) {
+        task_set_fd(current, f, -1);
         return r;
     }
 
-    int f = task_new_fd(current, 0, r);
-    if (f == -1) {
-        CALL_FUNC(close, r);
-        errno = ENOMEM;
-    }
+    task_set_fd(current, f, r);
     return f;
 }
 
@@ -1859,10 +3182,22 @@ int openat(int dirfd, const char *pathname, int flags, ...)
 }
 
 ssize_t read(int fd, void *buf, size_t count)
-{ return CALL_FUNC(read, t_fd(fd), buf, count); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(read, t_fd(fd), buf, count);
+    
+    return fops_read(fops, t_fd(fd), buf, count);
+}
 
 ssize_t write(int fd, const void *buf, size_t count)
-{ return CALL_FUNC(write, t_fd(fd), buf, count); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(write, t_fd(fd), buf, count);
+    
+    return fops_write(fops, t_fd(fd), buf, count);
+}
 
 int close(int fd)
 {
@@ -1870,18 +3205,74 @@ int close(int fd)
         return CALL_FUNC(close, fd);
     
     task_lock(current);
-    int r = CALL_FUNC(close, t_fd(fd));
-    if (r == 0)
-        current->tsk_fd[fd] = -1;
+    struct fops *f = fops_for_fd_locked(current, fd);
+    int r = 0;
+    if (f && f->f_closelocked)
+        r = f->f_closelocked(t_fd(fd));
+    
+    if (!r)
+        r = CALL_FUNC(close, t_fd(fd));
+    else
+        CALL_FUNC(close, t_fd(fd));
+    
+    current->tsk_fd[fd] = -1;
     task_unlock(current);
     return r;
 }
 
 ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
-{ return CALL_FUNC(readv, t_fd(fd), iov, iovcnt); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(readv, t_fd(fd), iov, iovcnt);
+    
+    // TODO: scatter-gather needs to be "atomic", maybe IO-lock per fops or per device instance?
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        ssize_t curr = fops_read(fops, t_fd(fd), iov[i].iov_base, iov[i].iov_len);
+        if (curr == 0)
+            break;
+        if (curr < 0) {
+            if (total == 0)
+                return -1;
+            break;
+        }
+
+        total += curr;
+
+        if (curr < iov[i].iov_len)
+            break;
+    }
+
+    return total;
+}
 
 ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
-{ return CALL_FUNC(writev, t_fd(fd), iov, iovcnt); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(writev, t_fd(fd), iov, iovcnt);
+    
+    // TODO: see readv()
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        ssize_t curr = fops_write(fops, t_fd(fd), iov[i].iov_base, iov[i].iov_len);
+        if (curr == 0)
+            break;
+        if (curr < 0) {
+            if (total == 0)
+                return -1;
+            break;
+        }
+
+        total += curr;
+
+        if (curr < iov[i].iov_len)
+            break;
+    }
+
+    return total;
+}
 
 off_t lseek(int fd, off_t offset, int whence)
 { return CALL_FUNC(lseek, t_fd(fd), offset, whence); }
@@ -1891,21 +3282,66 @@ int fsync(int fd)
 
 int dup(int oldfd)
 {
-    int r = CALL_FUNC(dup, t_fd(oldfd));
-    if (r == -1) {
-        return r;
-    }
-
-    int f = task_new_fd(current, 0, r);
-    if (f == -1) {
-        CALL_FUNC(close, r);
-        errno = ENOMEM;
-    }
-    return f;
+    if (!main_task)
+        return CALL_FUNC(dup, oldfd);
+    
+    return fcntl(oldfd, F_DUPFD, 0);
 }
 
 int dup2(int oldfd, int newfd)
-{ return CALL_FUNC(dup2, t_fd(oldfd), t_fd(newfd)); }
+{
+    if (!main_task)
+        return CALL_FUNC(dup2, oldfd, newfd);
+    
+    task_lock(current);
+    if (t_fd(oldfd) < 0 || newfd < 0 || newfd >= MAX_FILES) {
+        task_unlock(current);
+        errno = EBADF;
+        return -1;
+    }
+
+    // fd is currently reserved
+    if (current->tsk_fd[newfd] < -1) {
+        task_unlock(current);
+        errno = EFAULT;
+        return -1;
+    }
+
+    if (oldfd == newfd) {
+        task_unlock(current);
+        return newfd;
+    }
+
+    int r = CALL_FUNC(dup, t_fd(oldfd));
+    if (r == -1) {
+        task_unlock(current);
+        return -1;
+    }
+
+    int rf = r;
+
+    struct fops *ofops = fops_for_fd_locked(current, oldfd);
+    rf |= fops_fdflag(ofops);
+    if ((0 != fops_dup(ofops, t_fd(oldfd), r))) {
+        CALL_FUNC(close, r);
+        task_unlock(current);
+        errno = EFAULT;
+        return -1;
+    }
+
+    // from here on out, no failures
+
+    struct fops *nfops = fops_for_fd_locked(current, newfd);
+    if (nfops && nfops->f_closelocked) {
+        nfops->f_closelocked(t_fd(newfd));
+    }
+
+    CALL_FUNC(close, t_fd(newfd));
+    current->tsk_fd[newfd] = rf;
+    
+    task_unlock(current);
+    return newfd;
+}
 
 int pipe(int pipefd[2])
 {
@@ -2044,15 +3480,29 @@ int fcntl(int fd, int cmd, ... /* arg */ )
     
     if (cmd == F_DUPFD) {
         // TODO: F_DUPFD_CLOEXEC
-        int r = CALL_FUNC(dup, t_fd(fd));
-        if (r == -1)
-            return r;
-        
-        int f = task_new_fd(current, (int)(long)arg, r);
-        if (f == -1) {
-            CALL_FUNC(close, r);
-            errno = ENOMEM;
+        int f = task_reserve_fd(current, (int)(long)arg);
+        if (-1 == f) {
+            errno = EMFILE;
+            return -1;
         }
+
+        int r = task_set_fd(current, f, CALL_FUNC(dup, t_fd(fd)));
+        if (r == -1) {
+            return r;
+        }
+
+        task_lock(current);
+
+        struct fops *fops = fops_for_fd_locked(current, fd);
+        current->tsk_fd[f] |= fops_fdflag(fops);
+        if (0 != fops_dup(fops, t_fd(fd), r)) {
+            CALL_FUNC(close, r);
+            current->tsk_fd[f] = -1;
+            f = -1;
+            errno = EFAULT;
+        }
+    
+        task_unlock(current);
         return f;
     }
     return CALL_FUNC(fcntl, t_fd(fd), cmd, arg);
@@ -2061,8 +3511,28 @@ int fcntl(int fd, int cmd, ... /* arg */ )
 int ftruncate(int fd, off_t length)
 { return CALL_FUNC(ftruncate, t_fd(fd), length); }
 
+int stat(const char *pathname, struct stat *statbuf)
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_pathname(pathname)))
+        return CALL_FUNC(stat, pathname, statbuf);
+
+    FOPS_PATH(fops, f_stat, pathname, statbuf);
+}
+
 int fstat(int fd, struct stat *statbuf)
-{ return CALL_FUNC(fstat, t_fd(fd), statbuf); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(fstat, t_fd(fd), statbuf);
+    
+    if (!fops->f_stat) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    
+    return fops->f_stat(t_fd(fd), statbuf);
+}
 
 int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 { return CALL_FUNC(fstatat, t_fd(dirfd), pathname, statbuf, flags); }
@@ -2070,15 +3540,55 @@ int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 int faccessat(int dirfd, const char *pathname, int mode, int flags)
 { return CALL_FUNC(faccessat, t_fd(dirfd), pathname, mode, flags); }
 
+int chmod(const char *pathname, mode_t mode)
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_pathname(pathname)))
+        return CALL_FUNC(chmod, pathname, mode);
+
+    FOPS_PATH(fops, f_chmod, pathname, mode);
+}
+
 int fchmod(int fd, mode_t mode)
-{ return CALL_FUNC(fchmod, t_fd(fd), mode); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(fchmod, t_fd(fd), mode);
+    
+    if (!fops->f_chmod) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    
+    return fops->f_chmod(t_fd(fd), mode);
+}
 
 // TODO support dirfd properly
 int fchmodat(int dirfd, const char *pathname, mode_t mode, int flags)
 { return CALL_FUNC(fchmodat, t_fd(dirfd), pathname, mode, flags); }
 
+int chown(const char *pathname, uid_t owner, gid_t group)
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_pathname(pathname)))
+        return CALL_FUNC(chown, pathname, owner, group);
+
+    FOPS_PATH(fops, f_chown, pathname, owner, group);
+}
+
 int fchown(int fd, uid_t owner, gid_t group)
-{ return CALL_FUNC(fchown, t_fd(fd), owner, group); }
+{
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(fchown, t_fd(fd), owner, group);
+    
+    if (!fops->f_chown) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    
+    return fops->f_chown(t_fd(fd), owner, group);
+}
 
 int fchownat(int dirfd, const char *pathname, uid_t owner, gid_t group, int flags)
 { return CALL_FUNC(fchownat, t_fd(dirfd), pathname, owner, group, flags); }
@@ -2223,7 +3733,17 @@ int ioctl(int fd, unsigned long request, ...)
     va_end(ap);
 
     // TODO can't there be ioctls with multiple args?
-    return CALL_FUNC(ioctl, fd, request, arg);
+    struct fops *fops;
+    if (!main_task || !(fops = fops_for_fd(current, fd)))
+        return CALL_FUNC(ioctl, fd, request, arg);
+    
+    if (!fops->f_ioctl) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    
+    return fops->f_ioctl(t_fd(fd), request, arg);
+    
 }
 
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
@@ -2332,6 +3852,7 @@ pid_t setsid(void) {
     
     task_lock(current);
     current->tsk_sid = current->tsk_pid;
+    current->tsk_state &= ~TS_CTTY;
     task_unlock(current);
 
     return current->tsk_sid;
@@ -2788,14 +4309,9 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
     // No failing from here!
 
     for (int i = 0; i < MAX_FILES; i++) {
-        
-        task_lock(current);
-        if (current->tsk_fd[i] == -1) {
-            task_unlock(current);
+        if (t_fd(i) == -1) 
             continue;
-        }
-        task_unlock(current);
-
+        
         int fd_flags = fcntl(i, F_GETFD);
         if (-1 == fd_flags)
             panic("execve(\"%s\") fcntl(%d, F_GETFD)", pathname, i);
@@ -2813,7 +4329,7 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
             panic("sigaction(%d)", i);
     }
     
-    // TODO if 0, 1, 2 we can be nice and open /dev/full, /dev/null and /dev/null for the program
+    // TODO if 0, 1, 2 are closed we can be nice and open /dev/full, /dev/null and /dev/null for the program
 
     cow_run_init_funcs(); // re-initialize copy-on-write vars with init statements
 
@@ -2956,72 +4472,185 @@ int openpty(int *amaster, int *aslave, char *name, const struct termios *termp, 
 {
     if (!main_task)
         return CALL_FUNC(openpty, amaster, aslave, name, termp, winp);
-    
-    int master, slave;
-    int r = CALL_FUNC(openpty, (amaster ? &master : NULL), (aslave ? &slave : NULL), name, termp, winp);
-    if (r != 0)
-        return r;
-    
-    if (amaster) {
-        int f = task_new_fd(current, 0, master);
-        if (f == -1) {
-            CALL_FUNC(close, master);
-            if (aslave)
-                CALL_FUNC(close, slave);
-            errno = ENOMEM;
-        }
-        *amaster = f;
+
+    // TODO
+    if (name || termp || winp)
+        panic("openpty todo");
+
+    int master = task_reserve_fd(current, 0);
+    if (master == -1) {
+        errno = EMFILE;
+        return -1;
     }
 
-    if (aslave) {
-        int f = task_new_fd(current, 0, slave);
-        if (f == -1) {
-            if (amaster) {
-                close(*amaster);
-                *amaster = -1;
-            }
-            CALL_FUNC(close, slave);
-            errno = ENOMEM;
-        }
-        *aslave = f;
-    }
-    return r;
-    
+    if (-1 == task_set_fd(current, master, ptm_open() | TFD_TTY))
+        return -1;
 
+    char sname[PATH_MAX];
+    if (0 != ptsname_r(master, sname, PATH_MAX)) {
+        close(master);
+        return -1;
+    }
+
+    int slave = open(sname, O_RDWR | O_NOCTTY);
+    if (-1 == slave) {
+        close(master);
+        return -1;
+    }
+
+    *amaster = master;
+    *aslave = slave;
+    return 0;
+}
+
+int isatty(int fd)
+{
+    if (!main_task)
+        return CALL_FUNC(isatty, t_fd(fd));
+    
+    if (islocaltty(fd))
+        return 1;
+    
+    return CALL_FUNC(isatty, t_fd(fd));
+}
+
+int ttyname_r(int fd, char *buf, size_t buflen)
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(ttyname_r, t_fd(fd), buf, buflen);
+    
+    struct tty *tt = tty_for_fd(t_fd(fd), TTM_MASTER);
+    if (tt) {
+        snprintf(buf, buflen, "%s", PTMX_FILE);
+        tty_unlock(tt);
+        return 0;
+    }
+
+    return tty_slavename(t_fd(fd), buf, buflen);
+}
+
+char *ttyname(int fd)
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(ttyname, t_fd(fd));
+
+    int r = ttyname_r(fd, tty_name, sizeof(tty_name));
+    if (r) {
+        INFO("X");
+        errno = r;
+        return NULL;
+    }
+
+    return tty_name;
+}
+
+int ptsname_r(int fd, char *buf, size_t buflen)
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(ptsname_r, t_fd(fd), buf, buflen);
+    
+    return tty_slavename(t_fd(fd), buf, buflen);
+}
+
+char *ptsname(int fd)
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(ptsname, t_fd(fd));
+
+    int r = ptsname_r(fd, pts_name, sizeof(pts_name));
+    if (r) {
+        errno = r;
+        return NULL;
+    }
+
+    return pts_name;
 }
 
 pid_t tcgetpgrp(int fd)
-{ return CALL_FUNC(tcgetpgrp, t_fd(fd)); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcgetpgrp, t_fd(fd));
+    
+    pid_t ret;
+    if (0 != ttyop_ioctl(t_fd(fd), TIOCGPGRP, &ret))
+        return -1;
+    return ret;
+}
 
-pid_t tcsetpgrp(int fd, pid_t pgrp)
-{ return CALL_FUNC(tcsetpgrp, t_fd(fd), pgrp); }
-
-int isatty(int fd)
-{ return CALL_FUNC(isatty, t_fd(fd)); }
-
-char *ttyname(int fd)
-{ return CALL_FUNC(ttyname, t_fd(fd)); }
-
-int ttyname_r(int fd, char *buf, size_t buflen)
-{ return CALL_FUNC(ttyname_r, t_fd(fd), buf, buflen); }
+int tcsetpgrp(int fd, pid_t pgrp)
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcsetpgrp, t_fd(fd), pgrp);
+    
+    return ttyop_ioctl(t_fd(fd), TIOCSPGRP, &pgrp); 
+}
 
 int tcgetattr(int fd, struct termios *termios_p)
-{ return CALL_FUNC(tcgetattr, t_fd(fd), termios_p); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcgetattr, t_fd(fd), termios_p);
+    
+    return ttyop_ioctl(t_fd(fd), TCGETS, termios_p);
+}
 
 int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
-{ return CALL_FUNC(tcsetattr, t_fd(fd), optional_actions, termios_p); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcsetattr, t_fd(fd), optional_actions, termios_p);
+    
+    int request;
+    switch (optional_actions) {
+        default:
+            errno = EINVAL;
+            return -1;
+        
+        case TCSANOW:
+            request = TCSETS;
+            break;
+        
+        case TCSADRAIN:
+            request = TCSETSW;
+            break;
+        
+        case TCSAFLUSH:
+            request = TCSETSF;
+            break;
+    }
+
+    return ttyop_ioctl(t_fd(fd), request, (void *)termios_p);
+}
 
 int tcsendbreak(int fd, int duration)
-{ return CALL_FUNC(tcsendbreak, t_fd(fd), duration); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcsendbreak, t_fd(fd), duration);
+    
+    return ttyop_ioctl(t_fd(fd), TCSBRK, (void *)(long)duration);
+}
 
 int tcdrain(int fd)
-{ return CALL_FUNC(tcdrain, t_fd(fd)); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcdrain, t_fd(fd));
+    
+    return tcsendbreak(fd, 1);
+}
 
 int tcflush(int fd, int queue_selector)
-{ return CALL_FUNC(tcflush, t_fd(fd), queue_selector); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcflush, t_fd(fd), queue_selector);
+    
+    return ttyop_ioctl(t_fd(fd), TCFLSH, (void *)(long)queue_selector);
+}
 
 int tcflow(int fd, int action)
-{ return CALL_FUNC(tcflow, t_fd(fd), action); }
+{
+    if (!main_task || !islocaltty(fd))
+        return CALL_FUNC(tcflow, t_fd(fd), action);
+    
+    return ttyop_ioctl(t_fd(fd), TCXONC, (void *)(long)action);
+}
 
 void *malloc(size_t size)
 {
