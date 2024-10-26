@@ -1314,8 +1314,8 @@ struct tty {
 LIST_HEAD(ttys);
 pthread_mutex_t ttys_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static COW_IMPL_ARRAY(char, tty_name, PATH_MAX);
-static COW_IMPL_ARRAY(char, pts_name, PATH_MAX);
+static COW_IMPL(char[PATH_MAX], tty_name);
+static COW_IMPL(char[PATH_MAX], pts_name);
 
 static cc_t ttydefchars[NCCS] = {
 	CEOF, CEOL, CEOL, CERASE, CWERASE, CKILL, CREPRINT,
