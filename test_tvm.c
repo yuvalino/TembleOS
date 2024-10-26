@@ -1157,7 +1157,7 @@ void helpexit(char *exe)
     printf("  -l             print test list and exit\n");
     printf("  -k=TEST        only run TEST (can be passed multiple times)\n");
     printf("  -v             verbose output\n");
-    printf("  -v             debug with gdb\n");
+    printf("  -g             debug with gdb\n");
     printf("  -h             display this help and exit\n");
     exit(0);
 }

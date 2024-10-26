@@ -1079,9 +1079,6 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
     if (!sigshutup) {
         INFO("signum=%d", signum);
-        if (signum == SIGSEGV) {
-            raise(SIGFPE);
-        }
     }
 
     if (!current)
