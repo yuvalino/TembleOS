@@ -2980,10 +2980,10 @@ char *fgets(char *s, int size, FILE *stream)
 }
 
 int getc(FILE *stream)
-{ return fgetc(t_f(stream)); }
+{ return fgetc(stream); }
 
 int getchar(void)
-{ return fgetc(t_f(stdin)); }
+{ return fgetc(stdin); }
 
 int ungetc(int c, FILE *stream)
 { return CALL_FUNC(ungetc, c, t_f(stream)); }
@@ -3063,7 +3063,7 @@ int vdprintf(int fd, const char *format, va_list ap)
     if (!s)
         return -1;
     
-    int wsize = vsnprintf(s, size, format, ap);    
+    int wsize = vsnprintf(s, size+1, format, ap);
     wsize = (int)fops_write(fops, t_fd(fd), s, wsize);
     free(s);
     return wsize;
@@ -3100,7 +3100,7 @@ void perror(const char *s)
     if (!main_task)
         return CALL_FUNC(perror, s);
     
-    fprintf(t_f(stderr), "%s: %s\n", s, strerror(errno));
+    fprintf(stderr, "%s: %s\n", s, strerror(errno));
 }
 
 int open(const char *pathname, int flags, ...)
