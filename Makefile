@@ -14,14 +14,14 @@ test:
 	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_forkless -lpthread -pie
 
 mksh:
-	@if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-g -rdynamic -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
-	@objcopy --redefine-sym main=mksh_main mksh/main.o
-	@ar rcs libmksh.a $(shell find mksh/ -type f -name '*.o')
+	if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-g -rdynamic -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
+	objcopy --redefine-sym main=mksh_main mksh/main.o
+	find mksh/ -type f -name '*.o' | xargs ar rcs libmksh.a
 
 dropbear: dummy
-	@if [ ! -f dropbear/Makefile ]; then cd dropbear && CFLAGS="-g -rdynamic -I$(realpath .)" ./configure; fi
-	@make -C dropbear/ PROGRAMS="dropbear scp" MULTI=1 LDFLAGS="/tmp/dummy.o -o /tmp/dummy.out && echo"
-	@ar rcs libdropbear.a $(shell find dropbear/ -type f -name '*.o')
+	if [ ! -f dropbear/Makefile ]; then cd dropbear && CFLAGS="-g -rdynamic -I$(realpath .)" ./configure; fi
+	make -C dropbear/ PROGRAMS="dropbear scp" MULTI=1 LDFLAGS="/tmp/dummy.o -o /tmp/dummy.out && echo"
+	find dropbear/ -type f -name '*.o' | xargs ar rcs libdropbear.a
 
 dummy:
 	@gcc dummy/dummy.c -c -o /tmp/dummy.o

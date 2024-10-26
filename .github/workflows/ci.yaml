@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+      branches: [ main ]
+  pull_request:
+      branches: [ main ]
+
+jobs:
+  build-and-test:
+      runs-on: ubuntu-22.04
+      steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: 'true'
+      - name: make
+        run: make
+      - name: test
+        run: make test && ./test_forkless
