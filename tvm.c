@@ -1145,7 +1145,7 @@ struct fops {
     int (*f_ioctl)(int fd, unsigned long request, void *arg);
     ssize_t (*f_read)(int fd, void *buf, size_t count, int offset);
     ssize_t (*f_write)(int fd, const void *buf, size_t count, int offset);
-    int (*f_closelocked)(int fd);
+    int (*f_close)(int fd);
 };
 
 static LIST_HEAD(devices);
@@ -1580,8 +1580,10 @@ static int ttyop_dup(int oldfd, int newfd) {
 static int ttyop_stat(int fd, struct stat *st)
 {
     struct tty *tt = tty_for_fd(fd, TTM_ALL);
-    if (!tt)
+    if (!tt) {
+        errno = ENOTTY;
         return -1;
+    }
 
     if (!st) {
         tty_unlock(tt);
@@ -1602,8 +1604,10 @@ static int ttyop_stat(int fd, struct stat *st)
 static int ttyop_chmod(int fd, mode_t mode)
 {
     struct tty *tt = tty_for_fd(fd, TTM_ALL);
-    if (!tt)
+    if (!tt) {
+        errno = ENOTTY;
         return -1;
+    }
 
     tt->t_mode = mode;
 
@@ -1614,10 +1618,12 @@ static int ttyop_chmod(int fd, mode_t mode)
 static int ttyop_chown(int fd, uid_t owner, gid_t group)
 {
     struct tty *tt = tty_for_fd(fd, TTM_ALL);
-    if (!tt)
+    if (!tt) {
+        errno = ENOTTY;
         return -1;
+    }
 
-    tt->t_uid =owner;
+    tt->t_uid = owner;
     tt->t_gid = group;
 
     tty_unlock(tt);
@@ -2129,7 +2135,7 @@ static ssize_t ttyop_write(int fd, const void *buf, size_t count, int offset)
 }
 
 
-static int ttyop_closelocked(int fd) {
+static int ttyop_close(int fd) {
     struct tty *tt = tty_for_fd(fd, TTM_MASTER);
     if (!tt)
         return 0;
@@ -2181,7 +2187,7 @@ static struct fops ttyops = {
     .f_ioctl = ttyop_ioctl,
     .f_read = ttyop_read,
     .f_write = ttyop_write,
-    .f_closelocked = ttyop_closelocked,
+    .f_close = ttyop_close,
 };
 REGISTER_DEV(ttyops);
 
@@ -3206,17 +3212,21 @@ int close(int fd)
     
     task_lock(current);
     struct fops *f = fops_for_fd_locked(current, fd);
-    int r = 0;
-    if (f && f->f_closelocked)
-        r = f->f_closelocked(t_fd(fd));
-    
-    if (!r)
-        r = CALL_FUNC(close, t_fd(fd));
-    else
-        CALL_FUNC(close, t_fd(fd));
-    
+    int rfd = t_fd(fd);
     current->tsk_fd[fd] = -1;
     task_unlock(current);
+
+    // we had to "detach" the fd from `current` so we can call fops->close with task unlocked
+
+    int r = 0;
+    if (f && f->f_close)
+        r = f->f_close(rfd);
+    
+    if (!r)
+        r = CALL_FUNC(close, rfd);
+    else
+        CALL_FUNC(close, rfd);
+    
     return r;
 }
 
@@ -3294,7 +3304,12 @@ int dup2(int oldfd, int newfd)
         return CALL_FUNC(dup2, oldfd, newfd);
     
     task_lock(current);
-    if (t_fd(oldfd) < 0 || newfd < 0 || newfd >= MAX_FILES) {
+    int oldfd_real = t_fd(oldfd);
+    int newfd_realprev = t_fd(newfd);
+    int newfd_realprevflags = current->tsk_fd[newfd];
+    int newfd_realnext = -1;
+
+    if (oldfd_real < 0 || newfd < 0 || newfd >= MAX_FILES) {
         task_unlock(current);
         errno = EBADF;
         return -1;
@@ -3312,18 +3327,27 @@ int dup2(int oldfd, int newfd)
         return newfd;
     }
 
-    int r = CALL_FUNC(dup, t_fd(oldfd));
-    if (r == -1) {
+    newfd_realnext = CALL_FUNC(dup, oldfd_real);
+    if (newfd_realnext == -1) {
         task_unlock(current);
         return -1;
     }
 
-    int rf = r;
+    int newfd_realnextflags = newfd_realnext;
 
     struct fops *ofops = fops_for_fd_locked(current, oldfd);
-    rf |= fops_fdflag(ofops);
-    if ((0 != fops_dup(ofops, t_fd(oldfd), r))) {
-        CALL_FUNC(close, r);
+    newfd_realnextflags |= fops_fdflag(ofops);
+    current->tsk_fd[newfd] = newfd_realnextflags;
+    struct fops *nfops = fops_for_fd_locked(current, newfd);
+    task_unlock(current);
+
+    // TODO from here on theres an inherent race with other threads in the same process
+    //      if `fops_dup` fails. maybe we need to proc_fdlock() or smth
+
+    if ((0 != fops_dup(ofops, oldfd_real, newfd_realnext))) {
+        task_lock(current);
+        current->tsk_fd[newfd] = newfd_realprevflags;
+        CALL_FUNC(close, newfd_realnext);
         task_unlock(current);
         errno = EFAULT;
         return -1;
@@ -3331,15 +3355,12 @@ int dup2(int oldfd, int newfd)
 
     // from here on out, no failures
 
-    struct fops *nfops = fops_for_fd_locked(current, newfd);
-    if (nfops && nfops->f_closelocked) {
-        nfops->f_closelocked(t_fd(newfd));
+    if (nfops && nfops->f_close) {
+        nfops->f_close(newfd_realprev);
     }
 
-    CALL_FUNC(close, t_fd(newfd));
-    current->tsk_fd[newfd] = rf;
+    CALL_FUNC(close, newfd_realprev);
     
-    task_unlock(current);
     return newfd;
 }
 
