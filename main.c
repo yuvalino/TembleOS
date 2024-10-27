@@ -69,12 +69,18 @@ int main(int argc, char **argv)
     tvm_init();
     tvm_register_program("/bin/sh", (main_func_t) mksh_main);
     tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
-    printf("Hello, World!\n");
+    
+    char *addr_port = (char *)"2222";
+    if (argc >= 2)
+        addr_port = argv[1];
+    
     char *nargv[] = {
         argv[0],
         //"-vvvvvv",
         "-F",
         "-E",
+        "-p",
+        addr_port,
         NULL
     };
     return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);

@@ -3,3 +3,4 @@
 *.o
 forkless
 test_forkless
+__pycache__
