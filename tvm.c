@@ -2301,7 +2301,7 @@ static int is_valid_ptr(void *ptr)
     if (1 != CALL_FUNC(write, p[1], ptr, 1))
         goto out;
 
-    ret = 1;
+    r = 1;
 
 out:
     CALL_FUNC(close, p[0]);
