@@ -2291,40 +2291,23 @@ static int cow_get_thread_ptrs(void ***out_data)
     return 0;
 }
 
-// TODO words cannot explain how retarded this is
-static pthread_mutex_t ptrchk_lock = PTHREAD_MUTEX_INITIALIZER;
-static jmp_buf ptrchk_retbuf;
-static void ptrchk_handler(int) { siglongjmp(ptrchk_retbuf, 2); }
 static int is_valid_ptr(void *ptr)
 {
-    int jmpval;
-    struct sigaction segvoldact, busoldact, act = { .sa_handler = ptrchk_handler };
+    int r = 0;
+    int p[2];
+    if (-1 == CALL_FUNC(pipe, p))
+        return 0;
 
-    pthread_mutex_lock(&ptrchk_lock);
-    int oldsigshutup = sigshutup;
-    sigshutup = 1;
+    if (1 != CALL_FUNC(write, p[1], ptr, 1))
+        goto out;
 
-    if (0 != sigaction(SIGSEGV, &act, &segvoldact))
-        panic("sigaction(SIGSEGV, act)");
-    if (0 != sigaction(SIGBUS, &act, &busoldact))
-        panic("sigaction(SIGBUS, act)");
+    ret = 1;
 
-    // need sigsetjmp because we're longjmp'ing from signal handler
-    if (0 != (jmpval = sigsetjmp(ptrchk_retbuf, 1)))
-    {
-        if (0 != sigaction(SIGSEGV, &segvoldact, NULL))
-            panic("sigaction(SIGSEGV, oldact)");
-        if (0 != sigaction(SIGBUS, &busoldact, NULL))
-            panic("sigaction(SIGBUS, oldact)");
-        
-        sigshutup = oldsigshutup;
-        pthread_mutex_unlock(&ptrchk_lock);
+out:
+    CALL_FUNC(close, p[0]);
+    CALL_FUNC(close, p[1]);
 
-        return (jmpval == 1);
-    }
-
-    int a = *((int *)ptr);
-    siglongjmp(ptrchk_retbuf, 1);
+    return r;
 }
 
 struct cow_deepcopy_ctx {
