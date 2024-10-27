@@ -25,10 +25,15 @@
 #include <sys/file.h>
 #include <limits.h>
 #include <termios.h>
-#include <pty.h>
-#include <malloc.h>
 #include <getopt.h>
 #include <grp.h>
+#include <signal.h>
+
+#if defined(__APPLE__)
+#include <util.h>
+#elif defined(__linux__)
+#include <pty.h>
+#endif
 
 #include "tvm.h"
 
@@ -61,6 +66,9 @@ static void __panic(const char *m, const char *f, int l);
 
 #define MALLOC_MAGIC ((uintptr_t) 0xFACEFACE)
 
+#define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
+#define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
+
 /////////////
 // List
 /////////////
@@ -70,6 +78,7 @@ static void __panic(const char *m, const char *f, int l);
 
 #define LIST_HEAD_INIT(name) { &(name), &(name) }
 
+#undef LIST_HEAD
 #define LIST_HEAD(name) \
 	struct list_head name = LIST_HEAD_INIT(name)
 
@@ -231,7 +240,6 @@ DECL_FUNC(symlinkat);
 DECL_FUNC(linkat);
 DECL_FUNC(renameat);
 DECL_FUNC(unlinkat);
-DECL_FUNC(mknodat);
 DECL_FUNC(mkdirat);
 
 DECL_FUNC(socket);
@@ -284,7 +292,6 @@ DECL_FUNC(getenv);
 DECL_FUNC(putenv);
 DECL_FUNC(setenv);
 DECL_FUNC(unsetenv);
-DECL_FUNC(clearenv);
 
 DECL_FUNC(execve);
 DECL_FUNC(execl);
@@ -292,7 +299,6 @@ DECL_FUNC(execlp);
 DECL_FUNC(execle);
 DECL_FUNC(execv);
 DECL_FUNC(execvp);
-DECL_FUNC(execvpe);
 
 DECL_FUNC(openpty);
 
@@ -319,6 +325,12 @@ DECL_FUNC(getopt);
 DECL_FUNC(getopt_long);
 DECL_FUNC(getopt_long_only);
 
+#if defined(__linux__)
+DECL_FUNC(mknodat);
+DECL_FUNC(clearenv);
+DECL_FUNC(execvpe);
+#endif
+
 __attribute__((constructor))
 static void init_funcs()
 {
@@ -336,8 +348,15 @@ static void init_funcs()
 
 static pid_t __gettid()
 {
-#ifdef __linux__
+#if defined(__linux__)
     return syscall(SYS_gettid);
+#elif defined(__APPLE__)
+    uint64_t thread_id;
+    if (0 != pthread_threadid_np(pthread_self(), &thread_id))
+        panic("pthread_threadid_np");
+    // 31-bit thread id with 31th bit on
+    // its 31-bit to ensure its positive
+    return (pid_t)((thread_id & ((1ULL << 31)-1)) | (1ULL << 30));
 #else
 #error platform
 #endif
@@ -375,8 +394,8 @@ static int intparse(const char *s, long long *out, int base)
 // Jmpbuf manipulation
 /////////////
 
-#ifdef __linux__
-#ifdef __x86_64__
+#if defined(__linux__)
+#if defined(__x86_64__)
 
 #define JB_RBX	0
 #define JB_RBP	1
@@ -419,12 +438,97 @@ static void *jmpbuf_getstack(jmp_buf *jmpbuf)
     return jb[JB_RSP];
 }
 
+#undef PTR_MANGLE
+#undef PTR_DEMANGLE
+
+#endif
+#elif defined(__APPLE__)
+#if defined(__aarch64__)
+
+#define JMP_FP 10
+#define JMP_LR 11
+#define JMP_SP 12
+
+#define PTR_MANGLE(var) do { \
+        uint64_t __TOKEN; \
+        asm ("mrs %0, TPIDRRO_EL0\n" : "=r" (__TOKEN)); \
+        *((uint64_t *) &var) ^= ((uint64_t *) (__TOKEN & ~0x7ULL))[7]; \
+    } while (0)
+
+#define PTR_DEMANGLE(var) do { \
+        uint64_t __TOKEN; \
+        asm ("mrs %0, TPIDRRO_EL0\n" : "=r" (__TOKEN)); \
+        *((uint64_t *) &var) ^= ((uint64_t *) (__TOKEN & ~0x7ULL))[7]; \
+    } while (0)
+
+static uint64_t
+xpaci(uint64_t pointer) {
+	asm("xpaci %[value]\n" : [value] "+r"(pointer));
+	return pointer;
+}
+
+static uint64_t
+pacibsp(uint64_t pointer, uint64_t context) {
+	asm(
+        "mov x2, sp\n"
+        "mov x3, lr\n"
+        "mov sp, %[context]\n"
+        "mov lr, %[pointer]\n"
+        "pacibsp\n"
+        "mov %[pointer], lr\n"
+        "mov sp, x2\n"
+        "mov lr, x3\n"
+        :
+        [pointer] "+r"(pointer), [context] "+r"(context)
+    );
+	return pointer;
+}
+
+static uint64_t
+xpacd(uint64_t pointer) {
+	asm("xpacd %[value]\n" : [value] "+r"(pointer));
+	return pointer;
+}
+
+static void jmpbuf_mangle(jmp_buf *jmpbuf)
+{
+    uint64_t *jb = (uint64_t *) (jmpbuf);
+
+    jb[JMP_LR] = pacibsp(jb[JMP_LR], jb[JMP_SP]);
+
+    PTR_MANGLE(jb[JMP_FP]);
+    PTR_MANGLE(jb[JMP_LR]);
+    PTR_MANGLE(jb[JMP_SP]);
+}
+
+static void jmpbuf_demangle(jmp_buf *jmpbuf)
+{
+    uint64_t *jb = (uint64_t *) (jmpbuf);
+    PTR_DEMANGLE(jb[JMP_FP]);
+    PTR_DEMANGLE(jb[JMP_LR]);
+    PTR_DEMANGLE(jb[JMP_SP]);
+
+    jb[JMP_LR] = xpaci(jb[JMP_LR]);
+}
+
+static void *jmpbuf_getstack(jmp_buf *jmpbuf)
+{
+    void **jb = (void **) (jmpbuf);
+    return jb[JMP_SP];
+}
+
+#undef PTR_MANGLE
+#undef PTR_DEMANGLE
+
+#endif
+#endif
+
 static void jmpbuf_setstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_stack, size_t stack_size)
 {
     uintptr_t *jb = (uintptr_t*) (jmpbuf);
     intptr_t diff = old_stack - new_stack;
  
-    for (int i = 0; i < (JB_SIZE/8); i++)
+    for (int i = 0; i < (sizeof(jmp_buf)/8); i++)
     {
         if (jb[i] >= old_stack && jb[i] < (old_stack + stack_size))
             jb[i] -= diff;
@@ -453,12 +557,6 @@ static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
 
     jmpbuf_setstack(jmpbuf, new_stack, old_stack, stack_size);
 }
-
-#undef PTR_MANGLE
-#undef PTR_DEMANGLE
-
-#endif
-#endif
 
 /////////////
 // Environment
@@ -695,6 +793,7 @@ static struct task *taskalloc()
     if (main_pthread == pthread_self() && !current) {
         main_task = t;
         t->tsk_pid = __gettid();
+        t->tsk_sid = t->tsk_pgid = t->tsk_pid;
         for (int i = 0; i < 3; i++)
             t->tsk_fd[i] = i;
         t->tsk_f[0] = stdin;
@@ -704,11 +803,6 @@ static struct task *taskalloc()
         t->tsk_environ = copyenv(environ);
         if (!t->tsk_environ)
             panic("copyenv");
-
-        if (-1 == (t->tsk_sid = CALL_FUNC(getsid, 0)))
-            panic("getsid");
-        if (-1 == (t->tsk_pgid = CALL_FUNC(getpgid, 0)))
-            panic("getpgid");
 
         struct pthread_entry *pent = make_pthread_entry(pthread_self());
         if (!pent)
@@ -1040,6 +1134,7 @@ static FILE *t_f(FILE *f)
 #define SAD_CTCH 5
 
 static const int default_signal_actions[MAX_SIGNALS] = {
+#if defined(__linux__)
     [SIGHUP]    = SAD_TERM, // 1
     [SIGINT]    = SAD_TERM, // 2
     [SIGQUIT]   = SAD_CORE, // 3
@@ -1071,6 +1166,39 @@ static const int default_signal_actions[MAX_SIGNALS] = {
     [SIGIO]     = SAD_TERM, // 29
     [SIGPWR]    = SAD_TERM, // 30
     [SIGSYS]    = SAD_CORE, // 31
+#elif defined(__APPLE__)
+    [SIGHUP]    = SAD_TERM, // 1
+    [SIGINT]    = SAD_TERM, // 2
+    [SIGQUIT]   = SAD_CORE, // 3
+    [SIGILL]    = SAD_CORE, // 4
+    [SIGTRAP]   = SAD_CORE, // 5
+    [SIGABRT]   = SAD_CORE, // 6
+    [SIGEMT]    = SAD_CORE, // 7
+    [SIGFPE]    = SAD_CORE, // 8
+    [SIGKILL]   = SAD_TERM, // 9
+    [SIGBUS]    = SAD_CORE, // 10
+    [SIGSEGV]   = SAD_CORE, // 11
+    [SIGSYS]    = SAD_CORE, // 12
+    [SIGPIPE]   = SAD_TERM, // 13
+    [SIGALRM]   = SAD_TERM, // 14
+    [SIGTERM]   = SAD_TERM, // 15
+    [SIGURG]    = SAD_IGN,  // 16
+    [SIGSTOP]   = SAD_STOP, // 17
+    [SIGTSTP]   = SAD_STOP, // 18
+    [SIGCONT]   = SAD_IGN,  // 19
+    [SIGCHLD]   = SAD_IGN,  // 20
+    [SIGTTIN]   = SAD_STOP, // 21
+    [SIGTTOU]   = SAD_STOP, // 22
+    [SIGIO]     = SAD_IGN,  // 23
+    [SIGXCPU]   = SAD_TERM, // 24
+    [SIGXFSZ]   = SAD_TERM, // 25
+    [SIGVTALRM] = SAD_TERM, // 26
+    [SIGPROF]   = SAD_TERM, // 27
+    [SIGWINCH]  = SAD_IGN,  // 28
+    [SIGINFO]   = SAD_IGN,  // 29
+    [SIGUSR1]   = SAD_TERM, // 30
+    [SIGUSR2]   = SAD_TERM, // 31
+#endif
 };
 
 static __thread int sigshutup = 0;
@@ -1078,7 +1206,10 @@ static __thread int sigshutup = 0;
 void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 {
     if (!sigshutup) {
-        INFO("signum=%d", signum);
+        if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL)
+            INFO("signum=%d at %p", signum, siginfo->si_addr);
+        else
+            INFO("signum=%d", signum);
     }
 
     if (!current)
@@ -1646,13 +1777,22 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
     int ret = -1;
 
     switch (request) {
+#if defined(__linux__)
         case TCGETS:
+#elif defined(__APPLE__)
+        case TIOCGETA:
+#endif
             memcpy(arg, &tt->t_termios, sizeof(tt->t_termios));
             ret = 0;
             break;
         
+#if defined(__linux__)
         case TCSETS:
         case TCSETSW:
+#elif defined(__APPLE__)
+        case TIOCSETA:
+        case TIOCSETAW:
+#endif
             memcpy(&tt->t_termios, arg, sizeof(tt->t_termios));
             ret = 0;
             break;
@@ -1769,6 +1909,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             ret = 0;
             break;
 
+#if defined(__linux__)
         case TIOCGSID:
             task_lock(current);
             if (!is_master &&
@@ -1782,6 +1923,7 @@ static int ttyop_ioctl(int fd, unsigned long request, void *arg)
             *((pid_t *) arg) = tt->t_sid;
             ret = 0;
             break;
+#endif
 
         default:
             errno = ENOTSUP;
@@ -2572,7 +2714,7 @@ static void *thread_entry(struct thread_arg *arg)
 
     if (0 != cow_set_thread_ptrs(arg->cow_data, &dctx))
         panic("cow_set_thread_ptrs");
-    
+
     // `fork()` needs dctx, so it will use it and free it in the `start_routine`
     if (arg->create_arg.cow_context)
         memcpy(arg->create_arg.cow_context, &dctx, sizeof(dctx));
@@ -2692,6 +2834,7 @@ void tvm_pthread_exit(void *retval)
 /////////////
 
 #define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
+#define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
 
 struct forkless_arg {
     jmp_buf jmpbuf;
@@ -2705,7 +2848,7 @@ struct forkless_arg {
 static void *forkless_entry(struct forkless_arg *arg)
 {
     void *curr_fp = (void **)__builtin_frame_address(0);
-    char fake_frame[FRAME_SIZE] = {0};
+    char fake_frame[FRAME_SIZE] __attribute__((aligned(16))) = {0};
 
     uintptr_t jmpbuf_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf);
     uintptr_t caller_frame = (uintptr_t)arg->caller_fp;
@@ -2759,7 +2902,11 @@ pid_t fork(void)
         .flags = TVM_PTHREAD_FORK,
         .cow_context = &arg.dctx,
     };
-    tvm_pthread_create_ex(&thr, NULL, (void *(*)(void *)) forkless_entry, (void *)&arg, &create_arg);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE);
+    tvm_pthread_create_ex(&thr, &attr, (void *(*)(void *)) forkless_entry, (void *)&arg, &create_arg);
+    pthread_attr_destroy(&attr);
     
     while (pid == -1) {}
     return pid;
@@ -2780,7 +2927,7 @@ void tvm_init()
     
     struct sigaction act = {
         .sa_sigaction = signal_handler,
-        .sa_flags = SA_SIGINFO,
+        .sa_flags = SA_SIGINFO | SA_RESTART,
     };
 
     for (int i = 0; i < MAX_SIGNALS; i++) {
@@ -2873,10 +3020,18 @@ int fflush(FILE *stream)
 void setbuf(FILE *stream, char *buf)
 { return CALL_FUNC(setbuf, t_f(stream), buf); }
 
+#if defined(__linux__)
 void setbuffer(FILE *stream, char *buf, size_t size)
+#elif defined(__APPLE__)
+void setbuffer(FILE *stream, char *buf, int size)
+#endif
 { return CALL_FUNC(setbuffer, t_f(stream), buf, size); }
 
+#if defined(__linux__)
 void setlinebuf(FILE *stream)
+#elif defined(__APPLE__)
+int setlinebuf(FILE *stream)
+#endif
 { return CALL_FUNC(setlinebuf, t_f(stream)); }
 
 int setvbuf(FILE *stream, char *buf, int mode, size_t size)
@@ -3103,7 +3258,7 @@ int open(const char *pathname, int flags, ...)
     if (__OPEN_NEEDS_MODE(flags)) {
         va_list ap;
         va_start(ap, flags);
-        mode_t m = va_arg(ap, mode_t);
+        mode_t m = va_arg(ap, int);
         va_end(ap);
         
         if (fops && fops->f_open)
@@ -3148,7 +3303,7 @@ int openat(int dirfd, const char *pathname, int flags, ...)
     if (__OPEN_NEEDS_MODE(flags)) {
         va_list ap;
         va_start(ap, flags);
-        mode_t m = va_arg(ap, mode_t);
+        mode_t m = va_arg(ap, int);
         va_end(ap);
         r = CALL_FUNC(openat, dirfd, pathname, flags, m);
     }
@@ -3615,9 +3770,6 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
 int unlinkat(int dirfd, const char *pathname, int flags)
 { return CALL_FUNC(unlinkat, t_fd(dirfd), pathname, flags); }
 
-int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev)
-{ return CALL_FUNC(mknodat, t_fd(dirfd), pathname, mode, dev); }
-
 int mkdirat(int dirfd, const char *pathname, mode_t mode)
 { return CALL_FUNC(mkdirat, t_fd(dirfd), pathname, mode); }
 
@@ -3870,7 +4022,7 @@ pid_t getsid(pid_t pid)
     struct task *t = task_for_pid(pid);
     if (!t)
         return CALL_FUNC(getsid, pid);
-    
+
     return t->tsk_sid;
 }
 
@@ -3964,7 +4116,11 @@ int setpgrp(void)
     return setpgid(0, 0);
 }
 
+#if defined(__linux__)
 sighandler_t signal(int signum, sighandler_t handler)
+#elif defined(__APPLE__)
+sig_t signal(int signum, sig_t handler)
+#endif
 {
     struct sigaction oldact, act = {
         .sa_handler = handler,
@@ -4271,18 +4427,6 @@ int unsetenv(const char *name)
     return 0;
 }
 
-int clearenv(void)
-{
-    if (!main_task)
-        return CALL_FUNC(clearenv);
-    
-    task_lock(current);
-    current->tsk_environ = NULL;
-    task_unlock(current);
-
-    return 0;
-}
-
 int execve(const char *pathname, char *const argv[], char *const envp[])
 {
     if (!main_task)
@@ -4452,24 +4596,22 @@ int execvp(const char *file, char *const argv[])
     if (!main_task)
         return CALL_FUNC(execvp, file, argv);
     
-    return execvpe(file, argv, tvm_environ);
-}
-
-int execvpe(const char *file, char *const argv[], char *const envp[])
-{
-    if (!main_task)
-        return CALL_FUNC(execvpe, file, argv, envp);
-    
     const char *pathname = find_program_pathname(file);
     if (!pathname) {
         errno = ENOENT;
         return -1;
     }
 
-    return execve(pathname, argv, envp);
+    return execve(pathname, argv, tvm_environ);
 }
 
-int openpty(int *amaster, int *aslave, char *name, const struct termios *termp, const struct winsize *winp)
+int openpty(int *amaster, int *aslave, char *name,
+#if defined(__linux__)
+    const struct termios *termp, const struct winsize *winp
+#elif defined(__APPLE__)
+    struct termios *termp, struct winsize *winp
+#endif
+)
 {
     if (!main_task)
         return CALL_FUNC(openpty, amaster, aslave, name, termp, winp);
@@ -4537,7 +4679,6 @@ char *ttyname(int fd)
 
     int r = ttyname_r(fd, tty_name, sizeof(tty_name));
     if (r) {
-        INFO("X");
         errno = r;
         return NULL;
     }
@@ -4590,8 +4731,12 @@ int tcgetattr(int fd, struct termios *termios_p)
 {
     if (!main_task || !islocaltty(fd))
         return CALL_FUNC(tcgetattr, t_fd(fd), termios_p);
-    
+
+#if defined(__linux__)
     return ttyop_ioctl(t_fd(fd), TCGETS, termios_p);
+#elif defined(__APPLE__)
+    return ttyop_ioctl(t_fd(fd), TIOCGETA, termios_p);
+#endif
 }
 
 int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
@@ -4606,15 +4751,27 @@ int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
             return -1;
         
         case TCSANOW:
+#if defined(__linux__)
             request = TCSETS;
+#elif defined(__APPLE__)
+            request = TIOCSETA;
+#endif
             break;
         
         case TCSADRAIN:
+#if defined(__linux__)
             request = TCSETSW;
+#elif defined(__APPLE__)
+            request = TIOCSETAW;
+#endif
             break;
         
         case TCSAFLUSH:
+#if defined(__linux__)
             request = TCSETSF;
+#elif defined(__APPLE__)
+            request = TIOCSETAF;
+#endif
             break;
     }
 
@@ -4626,7 +4783,16 @@ int tcsendbreak(int fd, int duration)
     if (!main_task || !islocaltty(fd))
         return CALL_FUNC(tcsendbreak, t_fd(fd), duration);
     
+#if defined(__linux__)
     return ttyop_ioctl(t_fd(fd), TCSBRK, (void *)(long)duration);
+#elif defined(__APPLE__)
+	if (ttyop_ioctl(t_fd(fd), TIOCSBRK, 0) == -1)
+		return -1;
+	usleep(400000);
+	if (ttyop_ioctl(t_fd(fd), TIOCCBRK, 0) == -1)
+		return -1;
+	return 0;
+#endif
 }
 
 int tcdrain(int fd)
@@ -4634,23 +4800,55 @@ int tcdrain(int fd)
     if (!main_task || !islocaltty(fd))
         return CALL_FUNC(tcdrain, t_fd(fd));
     
+#if defined(__linux__)
     return tcsendbreak(fd, 1);
+#elif defined(__APPLE__)
+    return ttyop_ioctl(t_fd(fd), TIOCDRAIN, NULL);
+#endif
 }
 
 int tcflush(int fd, int queue_selector)
 {
     if (!main_task || !islocaltty(fd))
         return CALL_FUNC(tcflush, t_fd(fd), queue_selector);
-    
+
+#if defined(__linux__)
     return ttyop_ioctl(t_fd(fd), TCFLSH, (void *)(long)queue_selector);
+#elif defined(__APPLE__)
+    int what = FREAD | FWRITE;
+    if (queue_selector == TCIFLUSH)
+        what = FREAD;
+    else if (queue_selector == TCOFLUSH)
+        what = FWRITE;
+    return ttyop_ioctl(t_fd(fd), TIOCFLUSH, &what);
+#endif
 }
 
 int tcflow(int fd, int action)
 {
     if (!main_task || !islocaltty(fd))
         return CALL_FUNC(tcflow, t_fd(fd), action);
-    
+
+#if defined(__linux__)
     return ttyop_ioctl(t_fd(fd), TCXONC, (void *)(long)action);
+#elif defined(__APPLE__)
+    unsigned long request;
+    switch (action) {
+	case TCOOFF:
+		request = TIOCSTOP;
+	case TCOON:
+        request = TIOCSTART;
+	case TCION:
+		request = TIOCIXON;
+	case TCIOFF:
+		request = TIOCIXOFF;
+    default:
+        errno = EINVAL;
+		return -1;
+	}
+
+    return ttyop_ioctl(t_fd(fd), request, NULL);
+#endif
 }
 
 void *malloc(size_t size)
@@ -4747,3 +4945,39 @@ int getopt_long_only(int argc, char * const argv[], const char *optstring, const
     pthread_mutex_unlock(&getopt_lock);
     return r;
 }
+
+#if defined(__linux__)
+
+/////////////
+// Linux-specific hooks
+/////////////
+
+int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev)
+{ return CALL_FUNC(mknodat, t_fd(dirfd), pathname, mode, dev); }
+
+int execvpe(const char *file, char *const argv[], char *const envp[])
+{
+    if (!main_task)
+        return CALL_FUNC(execvpe, file, argv, envp);
+    
+    const char *pathname = find_program_pathname(file);
+    if (!pathname) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    return execve(pathname, argv, envp);
+}
+
+int clearenv(void)
+{
+    if (!main_task)
+        return CALL_FUNC(clearenv);
+    
+    task_lock(current);
+    current->tsk_environ = NULL;
+    task_unlock(current);
+
+    return 0;
+}
+#endif

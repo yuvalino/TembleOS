@@ -35,9 +35,7 @@ Soon:
 ### Platforms
 
 - Linux x86-64
-
-Soon:
-- XNU ARM64
+- XNU arm64
 
 ### TVM
 

@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 PASSWORD = "alpine"
-TIMEOUT_SECONDS = 3
+TIMEOUT_SECONDS = 5
 
 @dataclass
 class Forkless:
@@ -32,7 +32,7 @@ def ssh(port: int, command: str | None = None, exe="ssh") -> Iterator[spawn]:
     portarg = "-p"
     localhost = " localhost"
     if exe == "scp":
-        portarg = "-P"
+        portarg = "-O -P"
         localhost = ""
     
     command = f"{exe} -q -oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null -oPubkeyAuthentication=no {portarg} {port}{localhost}" + command
@@ -54,7 +54,7 @@ def ssh(port: int, command: str | None = None, exe="ssh") -> Iterator[spawn]:
 @pytest.fixture
 def sshi(forkless: Forkless) -> Iterator[spawn]:
     with ssh(forkless.port) as p:
-        p.expect("# ")
+        p.expect(["# ", r"\$ "])
         yield p
 
 def test_running(forkless: Forkless):
@@ -63,6 +63,7 @@ def test_running(forkless: Forkless):
 def test_connect_echo(forkless: Forkless):
     with ssh(forkless.port, "echo hello") as p:
         p.expect("hello")
+        p.expect(EOF)
         assert 0 == p.wait()
 
 def test_scp(forkless: Forkless):
@@ -72,6 +73,7 @@ def test_scp(forkless: Forkless):
         w.write("hello")
     
     with ssh(forkless.port, f"localhost:{f1} {f2}", exe="scp") as p:
+        p.expect(EOF)
         assert 0 == p.wait()
 
     with open(f2, "r") as r:
@@ -88,7 +90,7 @@ def test_chukus(sshi: spawn):
 def test_sigint(sshi: spawn):
     sshi.sendline("scp -f")
     with pytest.raises(TIMEOUT):
-        sshi.expect("# ")
+        sshi.expect(["# ", r"\$ "])
     sshi.sendintr()
-    sshi.expect("# ")
+    sshi.expect(["# ", r"\$ "])
     
