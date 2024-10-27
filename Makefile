@@ -8,10 +8,10 @@ clean:
 	@make -C dropbear/ clean
 
 forkless: dropbear mksh
-	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -lz -lpthread -lutil -pie
+	gcc -g -rdynamic -Isrc/ src/tvm.c src/main.c -o forkless -L . -ldropbear -lmksh -lz -lpthread -lutil -pie
 
 test:
-	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_tvm -lpthread -pie
+	gcc -g -rdynamic -Isrc/ src/tvm.c src/test_tvm.c -o test_tvm -lpthread -pie
 
 mksh:
 	if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-g -rdynamic -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
@@ -24,4 +24,4 @@ dropbear: dummy
 	find dropbear/ -type f -name '*.o' | xargs ar rcs libdropbear.a
 
 dummy:
-	@gcc dummy/dummy.c -c -o /tmp/dummy.o
+	@gcc src/dummy/dummy.c -c -o /tmp/dummy.o
