@@ -9,8 +9,14 @@
 #include <signal.h>
 #include <getopt.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 #include <poll.h>
+
+#if defined(__linux__)
 #include <pty.h>
+#elif defined(__APPLE__)
+#include <util.h>
+#endif
 
 #include "tvm.h"
 
@@ -31,6 +37,10 @@ void _add_test(const char *n, void (*f)());
 //////////
 //// Tests
 //////////
+
+// TODO: right now using usleep for synchronization
+//       in macos github runners, 100ms sleeps proved too fast
+//       so we're doing 1sec sleeps now, this is very bad!
 
 TEST(ProcWait) {
     ASSERT_EQ(-1, wait(NULL));
@@ -74,13 +84,13 @@ TEST(ProcWNOHANG) {
     ASSERT_NEQ(p, -1);
 
     if (!p) {
-        usleep(100000);
+        usleep(1000000);
         _exit(0);
     }
     
     ASSERT_EQ(0, waitpid(-1, NULL, WNOHANG));
 
-    usleep(200000);
+    usleep(2000000);
     
     int s;
     ASSERT_EQ(p, waitpid(-1, &s, WNOHANG));
@@ -98,7 +108,7 @@ TEST(ProcWaitPgrp) {
         _exit(0);
     }
     
-    usleep(100000);
+    usleep(1000000);
 
     ASSERT_EQ(-1, waitpid(0, NULL, WNOHANG));
     ASSERT_EQ(errno, ECHILD);
@@ -130,7 +140,7 @@ TEST(ProcKill) {
     if (!p)
         pause();
     
-    usleep(200000);
+    usleep(2000000);
     ASSERT_EQ(kill(p, 11), 0);
 
     int s;
@@ -160,7 +170,7 @@ TEST(ProcParent) {
         if (!p_2) {
             printf("[%d] p2 start\n", getpid());
             pid_t pz_1 = getppid();
-            usleep(200000); // wait for p1 to die
+            usleep(2000000); // wait for p1 to die
             pid_t pz_2 = getppid();
 
             if (sizeof(pz_1) != write(pip[1], &pz_1, sizeof(pz_1)))
@@ -175,7 +185,7 @@ TEST(ProcParent) {
         
         printf("[%d] forked %d\n", getpid(), p_2);
 
-        usleep(100000); // let p2 do pz_1 = getppid() and get p1
+        usleep(1000000); // let p2 do pz_1 = getppid() and get p1
                         // also let parent do kill(p1, 0)
 
         if (sizeof(p_2) != write(pip[1], &p_2, sizeof(p_2)))
@@ -193,7 +203,7 @@ TEST(ProcParent) {
 
     ASSERT_EQ(0, kill(p2, 0));
 
-    usleep(200000); // wait for p1 to die completely
+    usleep(2000000); // wait for p1 to die completely
 
     ASSERT_EQ(-1, kill(p1, 0));
     ASSERT_EQ(ESRCH, errno);
@@ -223,7 +233,7 @@ TEST(ProcSid) {
             fprintf(stderr, "bad sid\n");
             exit(1);
         }
-        usleep(100000);
+        usleep(1000000);
         if (getpid() != setsid() || getpid() != getsid(0)) {
             perror("child: setsid");
             exit(2);
@@ -234,7 +244,7 @@ TEST(ProcSid) {
 
     ASSERT_EQ(getpid(), getsid(p));
 
-    usleep(200000);
+    usleep(2000000);
     ASSERT_EQ(p, getsid(p));
 
     int s;
@@ -257,7 +267,7 @@ TEST(ProcPgid) {
             exit(1);
         }
 
-        usleep(100000);
+        usleep(1000000);
 
         if (0 != setpgrp() || getpid() != getpgrp()) {
             perror("child: setpgid");
@@ -269,7 +279,7 @@ TEST(ProcPgid) {
 
     ASSERT_EQ(getpid(), getpgid(p));
 
-    usleep(200000);
+    usleep(2000000);
 
     ASSERT_EQ(getpid(), getsid(p));
     ASSERT_EQ(p, getpgid(p));
@@ -284,7 +294,7 @@ TEST(ProcPgidSet) {
     pid_t p1 = fork();
     ASSERT_NEQ(p1, -1);
     if (!p1) {
-        usleep(100000);
+        usleep(1000000);
         
         if (getpid() != getpgrp()) {
             fprintf(stderr, "p1 pgrp\n");
@@ -297,7 +307,7 @@ TEST(ProcPgidSet) {
     pid_t p2 = fork();
     ASSERT_NEQ(p2, -1);
     if (!p2) {
-        usleep(100000);
+        usleep(1000000);
         
         if (p1 != getpgrp()) {
             fprintf(stderr, "p2 pgrp\n");
@@ -354,7 +364,7 @@ TEST(SignalsHandler) {
 }
 
 static int testhandlersig = 0;
-static void testhandler(int) {
+static void testhandler(int signo) {
     testhandlersig++;
 }
 
@@ -369,7 +379,7 @@ TEST(SignalsSIGCHLD) {
     pid_t p = fork();
     ASSERT_NEQ(p, -1);
     if (!p) {
-        usleep(100000);
+        usleep(1000000);
         exit(0);
     }
     ASSERT_EQ(-1, wait(NULL));
@@ -380,7 +390,7 @@ TEST(SignalsSIGCHLD) {
     if (!p) {
         exit(0);
     }
-    usleep(100000);
+    usleep(1000000);
     ASSERT_EQ(-1, wait(NULL));
     ASSERT_EQ(errno, ECHILD);
 
@@ -418,7 +428,7 @@ TEST(SignalsPgrp) {
         _exit(0);
     }
 
-    usleep(100000);
+    usleep(1000000);
     
     ASSERT_EQ(0, kill(-p1, SIGTERM));
 
@@ -442,7 +452,7 @@ TEST(FDsInit) {
         exit(open("/dev/random", O_RDONLY));
     }
     
-    usleep(200000); // 200ms is more than enough
+    usleep(2000000); // 200ms is more than enough
     ASSERT_EQ(4, open("/dev/random", O_RDONLY)); // child had exited, so its FDs were cleared
     ASSERT_EQ(0, close(3)); // child fd table and parent are different, so can close 3 if child closed 3
     ASSERT_EQ(-1, close(3));
@@ -462,11 +472,11 @@ TEST(FDsPoll) {
         if (0 != pipe(pp))
             _exit(1);
 
-        usleep(200000);
+        usleep(2000000);
         _exit(0);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     int pp[2];
     ASSERT_EQ(0, pipe(pp));
@@ -492,7 +502,7 @@ TEST(FDsPoll) {
     FD_SET(pp[0], &rfds);
     FD_SET(pp[1], &wfds);
     ASSERT_EQ(select(nfds, &rfds, &wfds, NULL, &t), 1);
-    ASSERT_EQ(FD_ISSET(pp[1], &wfds), 1);
+    ASSERT_NEQ(FD_ISSET(pp[1], &wfds), 0);
     ASSERT_EQ(FD_ISSET(pp[0], &rfds), 0);
     
     ASSERT_EQ(1, write(pp[1], (void *)&rfds, 1));
@@ -502,8 +512,8 @@ TEST(FDsPoll) {
     FD_SET(pp[0], &rfds);
     FD_SET(pp[1], &wfds);
     ASSERT_EQ(select(nfds, &rfds, &wfds, NULL, &t), 2);
-    ASSERT_EQ(FD_ISSET(pp[1], &wfds), 1);
-    ASSERT_EQ(FD_ISSET(pp[0], &rfds), 1);
+    ASSERT_NEQ(FD_ISSET(pp[1], &wfds), 0);
+    ASSERT_NEQ(FD_ISSET(pp[0], &rfds), 0);
 }
 
 TEST(FDsFcntl) {
@@ -515,11 +525,11 @@ TEST(FDsFcntl) {
         if (0 != pipe(pp))
             _exit(1);
 
-        usleep(200000);
+        usleep(2000000);
         _exit(0);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     int pp[2];
     ASSERT_EQ(0, pipe(pp));
@@ -549,18 +559,18 @@ TEST(COWSingleThreaded) {
         if (cow_int != 69)
             _exit(1);
         cow_int = 5;
-        usleep(200000);
+        usleep(2000000);
         if (cow_int != 5)
             _exit(2);
         _exit(0);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     ASSERT_EQ(cow_int, 69);
     cow_int = 420;
 
-    usleep(200000);
+    usleep(2000000);
 
     ASSERT_EQ(cow_int, 420);
 
@@ -592,7 +602,7 @@ TEST(COWDeepCopy) {
                 _exit(2);
         }
         
-        usleep(200000);
+        usleep(2000000);
 
         for (int i = 0; i < 0x69; i++) {
             if (cow_deep.ptr[i] != 'A')
@@ -602,7 +612,7 @@ TEST(COWDeepCopy) {
         _exit(0);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     for (int i = 0; i < 0x69; i++) {
         if (cow_deep.ptr[i] != 'A')
@@ -610,7 +620,7 @@ TEST(COWDeepCopy) {
     }
     memset(cow_deep.ptr, 'B', 0x69);
 
-    usleep(200000);
+    usleep(2000000);
 
     int s;
     ASSERT_EQ(p, wait(&s));
@@ -638,7 +648,7 @@ TEST(COWDeepCopyMidBufferUnaligned)
         if (cow_deep.ptr == NULL)
             _exit(1);
         
-        usleep(100000);
+        usleep(1000000);
         
         if (0 != strcmp(cow_deep.ptr, "FGHIJ"))
             _exit(2);
@@ -673,7 +683,7 @@ TEST(COWDeepCopyInStack)
         if (ptr == NULL)
             _exit(1);
         
-        usleep(100000);
+        usleep(1000000);
         
         if (0 != strcmp(ptr, "FGHIJ"))
             _exit(2);
@@ -746,14 +756,14 @@ TEST(EnvFork) {
         if (0 != strcmp(getenv("kd85n2lk2"), "2"))
             _exit(4);
         
-        usleep(200000);
+        usleep(2000000);
         
         if (0 != strcmp(getenv("kd85n2lk2"), "2"))
             _exit(5);
         _exit(0);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     ASSERT_EQ(0, strcmp(getenv("kd85n2lk2"), "1"));
     ASSERT_EQ(0, setenv("kd85n2lk2", "3", 1));
@@ -767,8 +777,12 @@ TEST(EnvFork) {
 
 TEST(EnvNULL) {
     ASSERT_NEQ(NULL, getenv("PATH"));
+#if defined(__linux__)
     ASSERT_EQ(0, clearenv());
     ASSERT_EQ(tvm_environ, NULL);
+#else
+    tvm_environ = NULL;
+#endif
     ASSERT_EQ(NULL, getenv("PATH"));
     ASSERT_EQ(0, unsetenv("PATH"));
     ASSERT_EQ(tvm_environ, NULL);
@@ -919,11 +933,11 @@ TEST(TTYDetachCloseMaster) {
         ASSERT_EQ(getpid(), setsid());
         ASSERT_EQ(0, ioctl(slave, TIOCSCTTY, 0));
 
-        usleep(200000);
+        usleep(2000000);
         exit(got_sig-1);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     ASSERT_EQ(0, close(master));
 
@@ -952,14 +966,14 @@ TEST(TTYDetachTIOCNOTTY) {
         ASSERT_NEQ(-1, p2);
 
         if (!p2) {
-            usleep(200000);
+            usleep(2000000);
             exit(got_sig-1);
         }
 
         ASSERT_EQ(0, setpgid(p2, p2));
         ASSERT_EQ(0, tcsetpgrp(slave, p2));
 
-        usleep(100000);
+        usleep(1000000);
 
         ASSERT_EQ(0, ioctl(slave, TIOCNOTTY, 0));
 
@@ -971,7 +985,7 @@ TEST(TTYDetachTIOCNOTTY) {
         exit(got_sig);
     }
 
-    usleep(100000);
+    usleep(1000000);
 
     int s;
     ASSERT_EQ(p, wait(&s));
