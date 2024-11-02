@@ -4,3 +4,6 @@
 [submodule "mksh"]
 	path = mksh
 	url = git@github.com:yuvalino/mksh-forkless.git
+[submodule "toybox"]
+	path = toybox
+	url = git@github.com:yuvalino/toybox-forkless.git

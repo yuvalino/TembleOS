@@ -28,6 +28,7 @@
 #include <getopt.h>
 #include <grp.h>
 #include <signal.h>
+#include <dirent.h>
 
 #if defined(__APPLE__)
 #include <util.h>
@@ -169,6 +170,7 @@ struct original_func_t {
 static LIST_HEAD(original_functions);
 
 DECL_FUNC(fdopen);
+DECL_FUNC(fdopendir);
 DECL_FUNC(fwrite);
 DECL_FUNC(fread);
 DECL_FUNC(fclose);
@@ -226,6 +228,7 @@ DECL_FUNC(ftruncate);
 DECL_FUNC(stat);
 DECL_FUNC(fstat);
 DECL_FUNC(fstatat);
+DECL_FUNC(access);
 DECL_FUNC(faccessat);
 DECL_FUNC(chmod);
 DECL_FUNC(fchmod);
@@ -729,7 +732,10 @@ static int t_fd(int fd)
     if (!current)
         panic("t_fd");
     
-    if (fd < 0 || fd >= MAX_FILES)
+    if (fd < 0)
+        return fd;
+    
+    if (fd >= MAX_FILES)
         return -1;
 
     if (current->tsk_fd[fd] >= 0)
@@ -2624,9 +2630,12 @@ void tvm_register_program(const char *pathname, main_func_t main_routine)
     if (NULL == (prog = malloc(sizeof(*prog))))
         panic("prog");
     
-    prog->pathname = pathname;
+    prog->pathname = strdup(pathname);
+    if (!prog->pathname)
+        panic("strdup");
+    
     prog->main_routine = main_routine;
-    prog->file = strchr(pathname, '/');
+    prog->file = strrchr(prog->pathname, '/');
     if (prog->file)
         prog->file++;
     else
@@ -2976,6 +2985,9 @@ static void __panic(const char *msg, const char *file, int line)
 FILE *fdopen(int fd, const char *mode)
 { return CALL_FUNC(fdopen, t_fd(fd), mode); }
 
+DIR *fdopendir(int fd)
+{ return CALL_FUNC(fdopendir, t_fd(fd)); }
+
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
     struct fops *fops;
@@ -3305,10 +3317,10 @@ int openat(int dirfd, const char *pathname, int flags, ...)
         va_start(ap, flags);
         mode_t m = va_arg(ap, int);
         va_end(ap);
-        r = CALL_FUNC(openat, dirfd, pathname, flags, m);
+        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags, m);
     }
     else
-        r = CALL_FUNC(openat, dirfd, pathname, flags);
+        r = CALL_FUNC(openat, t_fd(dirfd), pathname, flags);
     
     if (r == -1) {
         return r;
@@ -3669,11 +3681,20 @@ int ftruncate(int fd, off_t length)
 
 int stat(const char *pathname, struct stat *statbuf)
 {
-    struct fops *fops;
-    if (!main_task || !(fops = fops_for_pathname(pathname)))
+    if (!main_task)
         return CALL_FUNC(stat, pathname, statbuf);
 
-    FOPS_PATH(fops, f_stat, pathname, statbuf);
+    struct fops *fops;
+    if ((fops = fops_for_pathname(pathname))) {
+        FOPS_PATH(fops, f_stat, pathname, statbuf);
+    }
+
+    if (find_program(pathname)) {
+        statbuf->st_mode = S_IFREG | S_IXUSR | S_IXGRP | S_IXOTH;
+        return 0;
+    }
+
+    return CALL_FUNC(stat, pathname, statbuf);
 }
 
 int fstat(int fd, struct stat *statbuf)
@@ -3692,6 +3713,18 @@ int fstat(int fd, struct stat *statbuf)
 
 int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
 { return CALL_FUNC(fstatat, t_fd(dirfd), pathname, statbuf, flags); }
+
+int access(const char *pathname, int mode)
+{
+    if (!main_task)
+        return CALL_FUNC(access, pathname, mode);
+    
+    // make sure the shell finds our programs
+    if (find_program(pathname))
+        return 0;
+
+    return CALL_FUNC(access, pathname, mode);
+}
 
 int faccessat(int dirfd, const char *pathname, int mode, int flags)
 { return CALL_FUNC(faccessat, t_fd(dirfd), pathname, mode, flags); }

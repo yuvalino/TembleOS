@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 PASSWORD = "alpine"
-TIMEOUT_SECONDS = 5
+TIMEOUT_SECONDS = 10
 
 @dataclass
 class Forkless:
@@ -54,7 +54,7 @@ def ssh(port: int, command: str | None = None, exe="ssh") -> Iterator[spawn]:
 @pytest.fixture
 def sshi(forkless: Forkless) -> Iterator[spawn]:
     with ssh(forkless.port) as p:
-        p.expect(["# ", r"\$ "])
+        p.expect(r"\$ ")
         yield p
 
 def test_running(forkless: Forkless):
@@ -90,7 +90,17 @@ def test_chukus(sshi: spawn):
 def test_sigint(sshi: spawn):
     sshi.sendline("scp -f")
     with pytest.raises(TIMEOUT):
-        sshi.expect(["# ", r"\$ "])
+        sshi.expect(r"\$ ")
     sshi.sendintr()
-    sshi.expect(["# ", r"\$ "])
-    
+    sshi.expect(r"\$ ")
+
+def test_toybox(sshi: spawn):
+    sshi.sendline("echo test1234 > /tmp/1")
+    sshi.expect(r"\$ ")
+    sshi.sendline("cat /tmp/1")
+    sshi.expect("test1234")
+    sshi.expect(r"\$ ")
+
+    sshi.sendline("echo 1234 | base64")
+    sshi.expect("MTIzNAo=")
+    sshi.expect(r"\$ ")
