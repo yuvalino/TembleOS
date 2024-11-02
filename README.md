@@ -28,9 +28,7 @@ You may also ensure tests are passing by running `$ make test && ./test_forkless
 - `scp` - dropbear
 - `sh` - MirBSD Korn Shell
   - builtins (`echo`, `export`, `cd`, etc..)
-
-Soon:
-- busybox tools
+- `toybox` - `ls`, `cat`, `id`, `grep` etc
 
 ### Platforms
 
