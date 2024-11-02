@@ -22,7 +22,7 @@ jobs:
     - name: pythons deps
       run: python -m pip install pytest pexpect
     - name: macos deps
-      if: ${{ contains(matrix.os, 'macos' }}
+      if: ${{ contains(matrix.os, 'macos') }}
       run: hrew install gnu-sed
     - name: make
       run: make
