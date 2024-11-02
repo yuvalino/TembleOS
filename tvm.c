@@ -3360,6 +3360,11 @@ int close(int fd)
     task_lock(current);
     struct fops *f = fops_for_fd_locked(current, fd);
     int rfd = t_fd(fd);
+    if (rfd == -1) {
+        errno = EBADF;
+        task_unlock(current);
+        return -1;
+    }
     current->tsk_fd[fd] = -1;
     task_unlock(current);
 
