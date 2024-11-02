@@ -23,7 +23,7 @@ jobs:
       run: python -m pip install pytest pexpect
     - name: macos deps
       if: ${{ contains(matrix.os, 'macos') }}
-      run: hrew install gnu-sed
+      run: brew install gnu-sed
     - name: make
       run: make
     - name: test
