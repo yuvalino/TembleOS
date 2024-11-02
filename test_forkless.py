@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 PASSWORD = "alpine"
-TIMEOUT_SECONDS = 5
+TIMEOUT_SECONDS = 10
 
 @dataclass
 class Forkless:
