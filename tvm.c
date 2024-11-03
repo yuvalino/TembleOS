@@ -941,11 +941,13 @@ static struct task *taskalloc()
     return t;
 }
 
-static void taskdealloc(struct task *t)
+static void taskdealloc(struct task *t, int remove)
 {
-    pthread_mutex_lock(&tasks_lock);
-    list_del(&t->tsk_list);
-    pthread_mutex_unlock(&tasks_lock);
+    if (remove) {
+        pthread_mutex_lock(&tasks_lock);
+        list_del(&t->tsk_list);
+        pthread_mutex_unlock(&tasks_lock);
+    }
 
     if (t->tsk_pthreads_count != 1)
         panic("taskdealloc tsk_pthreads_count");
@@ -976,6 +978,8 @@ static void taskdealloc(struct task *t)
  */
 static void taskfreelastref(struct task *t, int dealloc)
 {
+    pthread_mutex_lock(&tasks_lock);
+
     for (int i = 0; i < 3; i++) {
         if (t->tsk_f[i] != NULL)
             CALL_FUNC(fclose, t->tsk_f[i]);
@@ -991,7 +995,6 @@ static void taskfreelastref(struct task *t, int dealloc)
         t->tsk_fd[i] = -1;
     }
 
-    pthread_mutex_lock(&tasks_lock);
     struct task *child;
     list_for_each_entry(child, &main_task->tsk_list, tsk_list) {
         if (child->tsk_parent == current) {
@@ -1000,11 +1003,15 @@ static void taskfreelastref(struct task *t, int dealloc)
             task_unlock(child);
         }
     }
+
+    if (dealloc)
+        list_del(&t->tsk_list);
+    
     pthread_mutex_unlock(&tasks_lock);
 
 
     if (dealloc)
-        taskdealloc(t);
+        taskdealloc(t, 0);
 }
 
 static int task_get_fd_locked(struct task *t, int min_fd)
@@ -1158,14 +1165,14 @@ static void terminate_current_locked(int result)
 
     if (auto_reap) {
         taskfreelastref(current, 1);
-        //pthread_detach(pthread_self());
+        // pthread_detach(pthread_self());
     }
     else {
         if (!parent)
             panic("auto_reap=0 but parent is NULL");
         
-        taskfreelastref(current, 0);
         pthread_mutex_lock(&parent->tsk_wait_lock);
+        taskfreelastref(current, 0);
 
         current->tsk_state |= TS_ZOMBIE;
         current->tsk_result = result;
@@ -4210,7 +4217,7 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
         *wstatus = zombiet->tsk_result;
-    taskdealloc(zombiet);
+    taskdealloc(zombiet, 1);
 
     return childpid;
 }
