@@ -39,10 +39,22 @@
 #include "tvm.h"
 
 /**
- * TODOs:
- * 1. thread exits
- * 2. signals - masks
- * 4. syscalls: posix_fadvise, posix_fallocate, posix_openpt, grantpt, ptsname, unlockpt
+ * Instructions unclear, ended up implementing a kernel.
+ *    (all I wanted was to have ssh server in iOS)
+ * 
+ * Well I haven't figured out entirely why, but this bad idea seems to work okay-ish.
+ * 
+ * TODO:
+ * - Multi-threading (with COW)
+ * - SIGSTOP/SIGTTIN/SIGTTOU without deadlocking the entire TVM
+ */
+
+/////////////
+// Macros
+/////////////
+
+/**
+ * "the things you need the most are the things you never have" - T.S.
  */
 
 #define panic(Msg, ...) do { char __MSG[0x1000] = {0}; snprintf(__MSG, sizeof(__MSG), Msg, ##__VA_ARGS__); __panic(__MSG, __FILE__, __LINE__); } while (0)
@@ -73,6 +85,10 @@ static void __panic(const char *m, const char *f, int l);
 /////////////
 // List
 /////////////
+
+/**
+ * Courtesy of the Linux Kernel (in XNU its a shitshow).
+ */
 
 #define LIST_POISON1  ((void *) 0x100)
 #define LIST_POISON2  ((void *) 0x122)
@@ -152,6 +168,18 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
 /////////////
 // Functions
 /////////////
+
+/**
+ * Get pointers to POSIX API functions so we can call them from their hook.
+ * 
+ * Basically, DECL_FUNC() just declares a global variable for that function's original pointer
+ *  and populates it on init.
+ * 
+ * Once a function is declared, we can provide CALL_FUNC(name, args...) and have the unhooked function called.
+ * 
+ * TODO:
+ * - On older ubuntu (20.04 for sure) some basic functions are missing from libc (like stat()), need to deal with that.
+ */
 
 #define LOCAL_SYM(Name) o_##Name
 #define DECL_FUNC(Name) \
@@ -397,6 +425,23 @@ static int intparse(const char *s, long long *out, int base)
 // Jmpbuf manipulation
 /////////////
 
+/**
+ * if you port to a new OS/architecture, good luck with this.
+ * 
+ * In order to properly have a `fork()` function that actually creates a thread behind the scenes,
+ * we need to copy stack frames from the parent's stack to the child's stack, so all the local
+ * variables will work on the child when `fork()` returns. To actually set the stack pointer
+ * we use `setjmp` and `longjmp`.
+ * 
+ * The tricky parts are:
+ * - Stack data copied from parent must be scanned for pointers pointing to the parent stack and fixed up to child stack.
+ * - Saved SP/LR/FP/PC registers are obfuscated with a thread-specific token and must be unobfuscated (mangle/demangle).
+ * - On arm64, pointer-authentication encrypts LR (return addresses).
+ * 
+ * TODO:
+ * - MacOS is compiled for arm64 meaning only APPLE library code has PAC for its LRs, but on iOS its arm64e which is for every program.
+ */
+
 #if defined(__linux__)
 #if defined(__x86_64__)
 
@@ -565,6 +610,18 @@ static void jmpbuf_dupstack(jmp_buf *jmpbuf, uintptr_t new_stack, uintptr_t old_
 // Environment
 /////////////
 
+/**
+ * Every process has its own environment data.
+ * 
+ * The POSIX design of environment is kind of bad.
+ * Due to older functions like `putenv()`, environment is assumed
+ * to have user pointers in it, so all environment data is "leaked"
+ * and never freed, relying on the OS to free all memory on exit.
+ * 
+ * Well, if you ever want to solve memory leaks, start with a per-task allocator arena
+ * and free all the deep-copied environment on `exit()`.
+ */
+
 extern char **environ;
 
 /**
@@ -654,6 +711,10 @@ static char **findenv(char **env, const char *name, size_t name_len)
 // Declarations
 /////////////
 
+/**
+ * Just needed this for code in `Task` section.
+ */
+
 struct fops;
 struct task;
 
@@ -664,6 +725,26 @@ int fops_dup(struct fops *fops, int oldfd, int newfd);
 /////////////
 // Task
 /////////////
+
+/**
+ * this is the fulcrum of tvm
+ * 
+ * This section basically implements our little kernel.
+ * Here we do resource management at the task ("process") level.
+ * 
+ * Every process created with `fork()` is represented as a task,
+ * with its own set of file-descriptors, signal handlers and other info.
+ * 
+ * On `fork()`, we inherit much of the information from our parent,
+ * except that we `dup()` all file-descriptors.
+ * 
+ * In addition, we need to manage links between parents, children and sessions/process groups
+ * so we could implement proper `kill(2)`/`waitpid(2)` semantics.
+ * 
+ * TODO:
+ * - Locks in this section were implemented very badly
+ * - `setrlimit()`/`getrlimit()`
+ */
 
 #define MAX_FILES 1024
 #define MAX_SIGNALS 32
@@ -1132,6 +1213,10 @@ static FILE *t_f(FILE *f)
 // Signals
 /////////////
 
+/**
+ * you have no idea how fun it was creating `default_signal_actions` for each operating system /s
+ */
+
 #define SAD_TERM 0
 #define SAD_IGN  1
 #define SAD_CORE 2
@@ -1265,6 +1350,19 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 // Devices
 /////////////
 
+/**
+ * Yeah when I said in `Task` section we create a little kernel,
+ * this section really got me to realize it.
+ * 
+ * We can't really use OS-level PTY/TTYs so we need to create our own
+ * userspace device drivers. This is our framework to do so.
+ * 
+ * Since `int` is very large for file-descriptor representation,
+ * we use the higher bits (but non-MSB, cause signess) to mark special devices
+ * in the file-descriptors table. We route IO operations on these FDs to the functions
+ * defined in `fops` structure, and every device driver and use REGISTER_DEV to register it.
+ */
+
 struct fops {
     struct list_head list;
 
@@ -1391,8 +1489,6 @@ ssize_t fops_read(struct fops *fops, int fd, void *buf, size_t count)
     return fops->f_read(fd, buf, count, -1);
 }
 
-
-
 ssize_t fops_write(struct fops *fops, int fd, const void *buf, size_t count)
 {
     if (!fops->f_write) {
@@ -1406,6 +1502,24 @@ ssize_t fops_write(struct fops *fops, int fd, const void *buf, size_t count)
 /////////////
 // PTY/TTY
 /////////////
+
+/**
+ * Yeah so we kinda can't really use OS-level PTY/TTY drivers for a number of reasons:
+ * - Controlling TTY is a process-specific attribute and we need multiple processes with controlling TTYs.
+ * - Because this concept is legacy and bug shitfest in every OS, they tend to limit who can use TTYs.
+ * 
+ * So there you go, our own TTY driver in userspace.
+ * In reality, we use a `socketpair()` behind the scenes with one side being the master and another the slave.
+ * This saves us a ton of code to implement (buffering, poll/select).
+ * Each character sent via each side is parsed individually in `tty_input` (master->slave) and `tty_output` (slave->master).
+ * 
+ * We also need to make sure `/dev/tty` returns the tasks' tty and not the host process tty.
+ * 
+ * Input/output code is courtesy of the XNU kernel (in Linux its a shitshow).
+ * 
+ * TODO:
+ * - Support enough features so atleast `vi` works.
+ */
 
 #define TTY_DIR "/tvm/pts"
 #define PTMX_FILE "/dev/ptmx"
@@ -2377,6 +2491,27 @@ static int tty_slavename(int fd, char *buf, size_t buflen)
 // Copy-On-Write (COW)
 /////////////
 
+/**
+ * Idea here is to let each task feel like it has COW memory with its parent,
+ * but in reality we deep-copy every relevant buffer.
+ * 
+ * The major downside here is that EVERY global must be declared/defined with COW_DECL()/COW_IMPL() macros.
+ * 
+ * How it works:
+ * 1. We register all global variables to a global list (with sizes)
+ * 2. We mark every `malloc()` buffer so we could identify it
+ * 3. On fork(), get all global variable pointers from parent
+ * 4. On fork(), memcpy() all parent global variables to the child
+ * 5. On fork(), iterate every global variable and recursively deep-copy malloc'd buffer pointers
+ * 6. On fork(), iterate copied stack frame (see `Forkless API` section) and deep-copy malloc'd pointers as-well
+ * 
+ * We also use a "deep-copy" cache (struct cow_deepcopy_ctx) so we properly handled pointers that appear twice while deep-copying.
+ * 
+ * TODO:
+ * - Find a way to NOT mark every global variable with COW_IMPL().
+ * - Support multi-threading, we can force dynamic tlsmodel and override _get_tls_data() resolve function.
+ */
+
 #define COW_DEEPCOPY 0x1
 
 struct cow_variable_t {
@@ -2601,6 +2736,10 @@ static void cow_run_init_funcs()
 // Getopt
 /////////////
 
+/**
+ * Atleast I tried to do something with this shitty API.
+ */
+
 __thread char *tvm_optarg;
 __thread int   tvm_optind = 1;
 __thread int   tvm_opterr;
@@ -2610,6 +2749,16 @@ static pthread_mutex_t getopt_lock = PTHREAD_MUTEX_INITIALIZER;
 /////////////
 // Exec
 /////////////
+
+/**
+ * Honestly the nicest code I've written in this shithole of a project.
+ * 
+ * Behind the scenes, exec() can never really exec() because the OS will kill our virtual-memory address-space... and our threads.
+ * So, we re-initialize all COW globals to their original values (or zero) and run a main function with the arguments.
+ * 
+ * New main functions can be registered in the host process by calling `tvm_register_program()` with its "virtual" pathnames.
+ * Make sure these paths are in PATH environment of the calling process.
+ */
 
 typedef int (*main_func_t)(int, char * const*, char * const*);
 struct exec_program {
@@ -2684,6 +2833,14 @@ static const char *find_program_pathname(const char *file)
 /////////////
 // tvm_pthread_* API
 /////////////
+
+/**
+ * This is the bread and butter of `fork()`.
+ * 
+ * This doesn't try to imitate the `fork()` API and all the parent stack frames fuckfest,
+ * but a simple API to create either a thread or a process ontop of `pthread_create` with a start routine,
+ * allocating/copying task struct and calling COW logic.
+ */
 
 #define TVM_PTHREAD_FORK 1
 
@@ -2842,6 +2999,14 @@ void tvm_pthread_exit(void *retval)
 // Forkless API
 /////////////
 
+/**
+ * Who knew imitating `fork()` API with threads is such a hassle. Well it is.
+ * 
+ * Idea is to `setjmp` on parent, on child stack copy some frames from the parent and `longjmp` to the new stack.
+ * Main problem is fixing up all the stack pointers on the frames pointer to the old stack to be on the new stack,
+ * read `Jmpbuf implementation` section for that.
+ */
+
 #define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
 #define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
 
@@ -2925,6 +3090,10 @@ pid_t fork(void)
 // API functions
 /////////////
 
+/**
+ * I have no idea why `__panic()` is here and at this point, I'm too afraid to ask.
+ */
+
 void tvm_init()
 {
     main_pthread = pthread_self();
@@ -2981,6 +3150,18 @@ static void __panic(const char *msg, const char *file, int line)
 /////////////
 // Hooks
 /////////////
+
+/**
+ * Oh yeah, there are SOOOO many more functions to hook.
+ * Code here mostly re-calls original functions with file-descriptors/streams translated with `t_fd()`/`t_f()`.
+ * Some code redirects the call to userspace device drivers.
+ * Some code needs to alter the task-specific file-descriptors/signal-handlers table.
+ * Also, handle variadic arguments when passing through... thats a big bummer.
+ * 
+ * TODO:
+ * - _FORTIFY_SOURCE - `__printf_chk()`, `__dup_chk()` etc (for now just don't compile with -Os)
+ * - Large-File-Support - `open64()`, `openat64()`, `fopen64()`, `lseek64()` etc (for now just don't compile with it)
+ */
 
 FILE *fdopen(int fd, const char *mode)
 { return CALL_FUNC(fdopen, t_fd(fd), mode); }
