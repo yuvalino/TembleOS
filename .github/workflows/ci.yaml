@@ -25,7 +25,7 @@ jobs:
       if: ${{ contains(matrix.os, 'macos') }}
       run: brew install gnu-sed
     - name: make
-      run: make
+      run: make -j
     - name: test
       run: pytest -v ./test_forkless.py
   tvm-test:
@@ -38,4 +38,4 @@ jobs:
       with:
         submodules: 'true'
     - name: test
-      run: make test && ./test_tvm
+      run: make test -j && ./test_tvm
