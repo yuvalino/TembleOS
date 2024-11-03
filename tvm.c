@@ -1151,7 +1151,7 @@ static void terminate_current_locked(int result)
         auto_reap = 0;
         notify_parent = 1;
 
-        struct sigaction *parent_act = &current->tsk_parent->tsk_sighandlers[SIGCHLD];
+        struct sigaction *parent_act = &parent->tsk_sighandlers[SIGCHLD];
         void *handler = ((parent_act->sa_flags & SA_SIGINFO) ? ((void *) parent_act->sa_sigaction) : ((void *) parent_act->sa_handler));
         
         if (handler == ((void *) SIG_IGN))
@@ -1160,7 +1160,8 @@ static void terminate_current_locked(int result)
         if ((parent_act->sa_flags & SA_NOCLDWAIT) || handler == ((void *) SIG_IGN))
             auto_reap = 1;
 
-        task_unlock(current->tsk_parent);
+        pthread_mutex_lock(&parent->tsk_wait_lock);
+        task_unlock(parent);
     }
 
     if (auto_reap) {
@@ -1171,13 +1172,11 @@ static void terminate_current_locked(int result)
         if (!parent)
             panic("auto_reap=0 but parent is NULL");
         
-        pthread_mutex_lock(&parent->tsk_wait_lock);
+        
         taskfreelastref(current, 0);
 
         current->tsk_state |= TS_ZOMBIE;
         current->tsk_result = result;
-        
-        pthread_mutex_unlock(&parent->tsk_wait_lock);
 
         task_unlock(current);
     }
@@ -1192,6 +1191,7 @@ static void terminate_current_locked(int result)
     // parent may be blocked on waitpid but no more pids, wake him up!
     if (parent) {
         task_unlock(parent);
+        pthread_mutex_unlock(&parent->tsk_wait_lock);
         pthread_cond_signal(&parent->tsk_wait_cond);
     }
 
