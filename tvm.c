@@ -781,7 +781,6 @@ struct task {
     FILE *tsk_f[3];
     int tsk_state;
     pthread_cond_t tsk_wait_cond;
-    pthread_mutex_t tsk_wait_lock;
     struct sigaction tsk_sighandlers[MAX_SIGNALS];
     unsigned tsk_pthreads_count;
     struct list_head tsk_pthreads;  // pthread_entry
@@ -847,6 +846,9 @@ static int t_fdr(int fd, int lock)
     return -1;
 }
 
+/**
+ * locks tasks_lock and current.
+ */
 static struct task *taskalloc()
 {
     struct task *t = malloc(sizeof(struct task));
@@ -863,9 +865,6 @@ static struct task *taskalloc()
 
     if (pthread_mutex_init(&t->tsk_lock, NULL) != 0) {
         panic("taskalloc::pthread_mutex_init(lock)");
-    }
-    if (pthread_mutex_init(&t->tsk_wait_lock, NULL) != 0) {
-        panic("taskalloc::pthread_mutex_init(wait_lock)");
     }
     if (pthread_cond_init(&t->tsk_wait_cond, NULL) != 0) {
         panic("taskalloc::pthread_cond_init(wait_cond)");
@@ -932,23 +931,18 @@ static struct task *taskalloc()
 
         memcpy(t->tsk_sighandlers, t->tsk_parent->tsk_sighandlers, sizeof(t->tsk_sighandlers));
 
+        task_unlock(current);
+
         pthread_mutex_lock(&tasks_lock);
         list_add_tail(&t->tsk_list, &main_task->tsk_list);
         pthread_mutex_unlock(&tasks_lock);
-        task_unlock(current);
     }
 
     return t;
 }
 
-static void taskdealloc(struct task *t, int remove)
+static void taskdealloc(struct task *t)
 {
-    if (remove) {
-        pthread_mutex_lock(&tasks_lock);
-        list_del(&t->tsk_list);
-        pthread_mutex_unlock(&tasks_lock);
-    }
-
     if (t->tsk_pthreads_count != 1)
         panic("taskdealloc tsk_pthreads_count");
     --t->tsk_pthreads_count;
@@ -966,7 +960,6 @@ static void taskdealloc(struct task *t, int remove)
         //free(*e);
 
     pthread_cond_destroy(&t->tsk_wait_cond);
-    pthread_mutex_destroy(&t->tsk_wait_lock);
     pthread_mutex_unlock(&t->tsk_lock);
     pthread_mutex_destroy(&t->tsk_lock);
 
@@ -974,11 +967,13 @@ static void taskdealloc(struct task *t, int remove)
 }
 
 /**
- * `t` locked.
+ * tasks_lock must either be locked or dolocktasks=1
+ * locks children
  */
-static void taskfreelastref(struct task *t, int dealloc)
+static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
 {
-    pthread_mutex_lock(&tasks_lock);
+    if (dolocktasks)
+        pthread_mutex_lock(&tasks_lock);
 
     for (int i = 0; i < 3; i++) {
         if (t->tsk_f[i] != NULL)
@@ -997,21 +992,20 @@ static void taskfreelastref(struct task *t, int dealloc)
 
     struct task *child;
     list_for_each_entry(child, &main_task->tsk_list, tsk_list) {
-        if (child->tsk_parent == current) {
-            task_lock(child); // TODO no way there aint deadlock here right?
+        if (child->tsk_parent == t) {
+            task_lock(child);
             child->tsk_parent = NULL;
             task_unlock(child);
         }
     }
 
-    if (dealloc)
+    if (dealloc) {
         list_del(&t->tsk_list);
+        taskdealloc(t);
+    }
     
-    pthread_mutex_unlock(&tasks_lock);
-
-
-    if (dealloc)
-        taskdealloc(t, 0);
+    if (dolocktasks)
+        pthread_mutex_unlock(&tasks_lock);
 }
 
 static int task_get_fd_locked(struct task *t, int min_fd)
@@ -1062,11 +1056,17 @@ static int task_new_fd(struct task *t, int min_fd, int new_fd) {
 
 }
 
-static struct task *task_for_pid(pid_t pid) {
+/**
+ * tasks_lock must be locked (or dolocktasks=1)
+ * returns locked task
+ */
+static struct task *task_for_pid(pid_t pid, int dolocktasks) {
     if (main_task->tsk_pid == pid)
         return main_task;
 
-    pthread_mutex_lock(&tasks_lock);
+    if (dolocktasks)
+        pthread_mutex_lock(&tasks_lock);
+    
     struct task *t;
     list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
         if (t->tsk_pid == pid) {
@@ -1074,16 +1074,59 @@ static struct task *task_for_pid(pid_t pid) {
         }
     }
 
-    // TODO prolly should lock task here, but need to not deadlock
-
-    pthread_mutex_unlock(&tasks_lock);
-
-    if (t == main_task)
+    // TODO is this okay?
+    if (t == main_task) {
+        if (dolocktasks)
+            pthread_mutex_unlock(&tasks_lock);
         return NULL;
+    }
+
+    task_lock(t);
+    if (dolocktasks)
+        pthread_mutex_unlock(&tasks_lock);
 
     return t;
 }
 
+/**
+ * both tasks_lock and t locked
+ * posix API with errno
+ */
+static int task_set_pgid(struct task *t, int pgid)
+{
+    if (t->tsk_pid == t->tsk_sid) {
+        errno = EPERM;
+        return -1;
+    }
+
+    struct task *ct;
+    list_for_each_entry(ct, &main_task->tsk_list, tsk_list)
+    {
+        // TODO lock ct?
+        if (pgid == ct->tsk_pgid)
+        {
+            if (t->tsk_pid == ct->tsk_pid || t->tsk_sid != ct->tsk_sid) {
+                errno = EPERM;
+                return -1;
+            }
+
+            t->tsk_pgid = ct->tsk_pgid;
+            return 0;
+        }
+    }
+
+    if (t->tsk_pid != pgid) {
+        errno = ESRCH;
+        return -1;
+    }
+
+    t->tsk_pgid = pgid;
+    return 0;
+}
+
+/**
+ * needs tasks_lock and t locked
+ */
 static int task_kill_locked(struct task *t, int signum) {
     if (list_empty(&t->tsk_pthreads))
         return ESRCH;
@@ -1093,11 +1136,9 @@ static int task_kill_locked(struct task *t, int signum) {
 }
 
 /**
- * `t->tsk_wait_lock` held
+ * `tasks_lock` held
  */
 static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found) {
-    pthread_mutex_lock(&tasks_lock);
-
     *found = 0;
 
     struct task *childt;
@@ -1124,14 +1165,16 @@ static struct task *task_next_zombie_child(struct task *t, pid_t pid, int *found
         break;
     }
 
-    pthread_mutex_unlock(&tasks_lock);
-
     if (childt == main_task)
         childt = NULL;
     
     return childt;
 }
 
+/**
+ * both tasks_lock and current are locked
+ * both are unlocked before returning
+ */
 __attribute__((noreturn))
 static void terminate_current_locked(int result)
 {
@@ -1141,13 +1184,18 @@ static void terminate_current_locked(int result)
     --current->tsk_refcount;
 
     // SIGCHLD special cases
-    struct task *parent = NULL;
+    struct task *parent = current->tsk_parent;
     int notify_parent = 0;
     int auto_reap = 1;
-    if (current->tsk_parent) {
-        task_lock(current->tsk_parent);
 
-        parent = current->tsk_parent;
+    if (parent) {
+
+        // lock order: tasks_lock -> parent -> child
+        // tasks_lock is already held
+        task_unlock(current);
+        task_lock(parent);
+        task_lock(current);
+
         auto_reap = 0;
         notify_parent = 1;
 
@@ -1159,21 +1207,18 @@ static void terminate_current_locked(int result)
     
         if ((parent_act->sa_flags & SA_NOCLDWAIT) || handler == ((void *) SIG_IGN))
             auto_reap = 1;
-
-        pthread_mutex_lock(&parent->tsk_wait_lock);
-        task_unlock(parent);
     }
 
     if (auto_reap) {
-        taskfreelastref(current, 1);
-        // pthread_detach(pthread_self());
+        taskfreelastref(current, 0, 1);
+        pthread_detach(pthread_self());
     }
     else {
         if (!parent)
             panic("auto_reap=0 but parent is NULL");
         
         
-        taskfreelastref(current, 0);
+        taskfreelastref(current, 0, 0);
 
         current->tsk_state |= TS_ZOMBIE;
         current->tsk_result = result;
@@ -1182,18 +1227,16 @@ static void terminate_current_locked(int result)
     }
     current = NULL;
 
-    if (parent)
-        task_lock(parent);
-
     if (notify_parent && 0 != task_kill_locked(parent, SIGCHLD))
         panic("terminate_current_locked notify parent failed (%d)", errno);
-    
+
     // parent may be blocked on waitpid but no more pids, wake him up!
     if (parent) {
-        task_unlock(parent);
-        pthread_mutex_unlock(&parent->tsk_wait_lock);
         pthread_cond_signal(&parent->tsk_wait_cond);
+        task_unlock(parent);
     }
+
+    pthread_mutex_unlock(&tasks_lock);
 
     CALL_FUNC(pthread_exit, 0);
     __builtin_unreachable();
@@ -1306,13 +1349,15 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
     if (!sigshutup) {
         if (signum == SIGSEGV || signum == SIGBUS || signum == SIGILL)
             INFO("signum=%d at %p", signum, siginfo->si_addr);
-        else
+        else if (signum != SIGCHLD)
             INFO("signum=%d", signum);
     }
 
     if (!current)
         panic("signal %d on pthread_exit", signum);
     
+    // `tasks_lock` required for `terminate_current_locked()`
+    pthread_mutex_lock(&tasks_lock);
     task_lock(current);
 
     struct sigaction *act = current->tsk_sighandlers + signum;
@@ -1328,6 +1373,8 @@ void signal_handler(int signum, siginfo_t *siginfo, void *ucontext)
 
     if (whatdo == SAD_TERM || whatdo == SAD_CORE)
         terminate_current_locked(mkwstatus(0, signum));
+    pthread_mutex_unlock(&tasks_lock);
+
     if (whatdo == SAD_IGN) {
         task_unlock(current);
         return;
@@ -2864,7 +2911,9 @@ struct thread_arg
     struct pthread_entry *pentry;
     void *(*start_routine) (void *);
     void *arg;
-    int wake; // condvar for child<->parent
+    pthread_mutex_t wake_mtx;
+    pthread_cond_t  wake_cond;
+    int wake;
     void **cow_data;
 };
 
@@ -2897,7 +2946,10 @@ static void *thread_entry(struct thread_arg *arg)
     void *(*start_routine)(void *) = arg->start_routine;
     void *routine_arg = arg->arg;
     
+    pthread_mutex_lock(&arg->wake_mtx);
     arg->wake = 1;
+    pthread_cond_broadcast(&arg->wake_cond);
+    pthread_mutex_unlock(&arg->wake_mtx);
 
     void *retval = start_routine(routine_arg);
     pthread_exit(retval);
@@ -2909,6 +2961,12 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
 
     struct thread_arg *targ = malloc(sizeof(struct thread_arg));
     if (!targ)
+        goto out;
+
+    if (0 != pthread_mutex_init(&targ->wake_mtx, NULL))
+        goto out;
+
+    if (0 != pthread_cond_init(&targ->wake_cond, NULL))
         goto out;
 
     targ->pentry = malloc(sizeof(struct pthread_entry));
@@ -2943,22 +3001,23 @@ int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(
     ret = CALL_FUNC(pthread_create, thread, attr, (void *(*)(void *))thread_entry, (void *)targ);
 
     if (0 == ret) {
-        while (0 == targ->wake) { }
+        pthread_mutex_lock(&targ->wake_mtx);
+        while (!targ->wake) {
+            pthread_cond_wait(&targ->wake_cond, &targ->wake_mtx);
+        }
+        pthread_mutex_unlock(&targ->wake_mtx);
     }
 
-    if (targ->cow_data)
-        free(targ->cow_data);
-    free(targ);
-
 out:
-    if (0 != ret)
+
+    if (targ)
     {
-        if (targ)
+        if (ret != 0)
         {
             if (create_arg->flags & TVM_PTHREAD_FORK)
             {
                 if (targ->task)
-                    taskfreelastref(targ->task, 1);
+                    taskfreelastref(targ->task, 1, 1);
             }
             else
             {
@@ -2970,9 +3029,13 @@ out:
             }
 
             if (targ->pentry)
-                free(targ->pentry);
-            free(targ);
+            free(targ->pentry);
         }
+
+        if (targ->cow_data)
+            free(targ->cow_data);
+
+        free(targ);
     }
 
     return ret;
@@ -3053,18 +3116,28 @@ static void *forkless_entry(struct forkless_arg *arg)
     longjmp(arg->jmpbuf, 1);
 }
 
+struct pidcond_t {
+    pid_t pid;
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+};
+
 pid_t fork(void)
 {
     if (!main_task)
         return CALL_FUNC(fork);
     
-    pid_t pid = -1;
+    struct pidcond_t pidcond = {-1};
+    pthread_mutex_init(&pidcond.mtx, NULL);
+    pthread_cond_init(&pidcond.cond, NULL);
+    struct pidcond_t *pidcondaddr = &pidcond;
+
     void **curr_fp = (void **)__builtin_frame_address(0);
     struct forkless_arg arg = {
         .fork_fp = curr_fp,
         .caller_fp = (void **)(*curr_fp)
     };
-    pid_t *pidaddr = (pid_t *) (((uintptr_t) &pid) ^ FORKLESS_STACK_MAGIC);
+    pidcondaddr = (struct pidcond_t *) (((uintptr_t) pidcondaddr) ^ FORKLESS_STACK_MAGIC);
     
     // NOTE: Why do we xor `pidaddr`?
     //       `jmpbuf_setstack` fixes up every pointer in the old stack to the new stack.
@@ -3072,8 +3145,11 @@ pid_t fork(void)
     //       because we're notifying the parent the child has finished setting up.
 
     if (0 != setjmp(arg.jmpbuf)) {
-        pidaddr = (pid_t *) (((uintptr_t) pidaddr) ^ FORKLESS_STACK_MAGIC);
-        *pidaddr = __gettid();
+        pidcondaddr = (struct pidcond_t *) (((uintptr_t) pidcondaddr) ^ FORKLESS_STACK_MAGIC);
+        pthread_mutex_lock(&pidcondaddr->mtx);
+        pidcondaddr->pid = __gettid();
+        pthread_cond_broadcast(&pidcondaddr->cond);
+        pthread_mutex_unlock(&pidcondaddr->mtx);
         return 0;
     }
     jmpbuf_demangle(&arg.jmpbuf);
@@ -3089,8 +3165,15 @@ pid_t fork(void)
     tvm_pthread_create_ex(&thr, &attr, (void *(*)(void *)) forkless_entry, (void *)&arg, &create_arg);
     pthread_attr_destroy(&attr);
     
-    while (pid == -1) {}
-    return pid;
+    pthread_mutex_lock(&pidcond.mtx);
+    while (pidcond.pid == -1) {
+        pthread_cond_wait(&pidcond.cond, &pidcond.mtx);
+    }
+    pthread_mutex_unlock(&pidcond.mtx);
+
+    pthread_mutex_destroy(&pidcond.mtx);
+    pthread_cond_destroy(&pidcond.cond);
+    return pidcond.pid;
 }
 
 /////////////
@@ -4138,6 +4221,7 @@ void _exit(int status)
     if (pthread_self() == main_pthread)
         CALL_FUNC(exit, status);
     
+    pthread_mutex_lock(&tasks_lock);
     task_lock(current);
 
     terminate_current_locked(mkwstatus(1, status));
@@ -4185,6 +4269,8 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
     struct task *zombiet = NULL;
     int found;
 
+    pthread_mutex_lock(&tasks_lock);
+
     // 0 is current pgid (which is marked in pid as `-pgid`)
     if (pid == 0) {
         task_lock(current);
@@ -4192,22 +4278,21 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
         task_unlock(current);
     }
 
-    pthread_mutex_lock(&current->tsk_wait_lock);
     while (!(zombiet = task_next_zombie_child(current, pid, &found))) {
         if (!found) {
-            pthread_mutex_unlock(&current->tsk_wait_lock);
+            pthread_mutex_unlock(&tasks_lock);
             errno = ECHILD;
             return -1;
         }
         if (options & WNOHANG) {
-            pthread_mutex_unlock(&current->tsk_wait_lock);
+            pthread_mutex_unlock(&tasks_lock);
             return 0;
         }
-        pthread_cond_wait(&current->tsk_wait_cond, &current->tsk_wait_lock);
+        pthread_cond_wait(&current->tsk_wait_cond, &tasks_lock);
     }
-    pthread_mutex_unlock(&current->tsk_wait_lock);
 
     task_lock(zombiet);
+    pthread_mutex_unlock(&tasks_lock);
     
     if (list_empty(&zombiet->tsk_pthreads))
         panic("waitpid tsk_pthreads empty");
@@ -4217,7 +4302,10 @@ pid_t waitpid(pid_t pid, int *wstatus, int options)
     pid_t childpid = zombiet->tsk_pid;
     if (wstatus)
         *wstatus = zombiet->tsk_result;
-    taskdealloc(zombiet, 1);
+
+    // lock ordering: tasks_lock before task
+    task_unlock(zombiet);
+    taskfreelastref(zombiet, 1, 1);
 
     return childpid;
 }
@@ -4226,15 +4314,23 @@ pid_t setsid(void) {
     if (!main_task)
         return CALL_FUNC(setsid);
     
-    if (-1 == setpgid(0, 0))
-        return -1;
-    
+    pthread_mutex_lock(&tasks_lock);
     task_lock(current);
+
+    if (-1 == task_set_pgid(current, current->tsk_pid)) {
+        task_unlock(current);
+        pthread_mutex_unlock(&tasks_lock);
+        return -1;
+    }
+
     current->tsk_sid = current->tsk_pid;
     current->tsk_state &= ~TS_CTTY;
-    task_unlock(current);
 
-    return current->tsk_sid;
+    task_unlock(current);
+    pthread_mutex_unlock(&tasks_lock);
+
+    // no need to lock because only set in `taskalloc()`
+    return current->tsk_pid;
 }
 
 pid_t getsid(pid_t pid)
@@ -4245,11 +4341,13 @@ pid_t getsid(pid_t pid)
     if (!pid)
         pid = current->tsk_pid;
     
-    struct task *t = task_for_pid(pid);
+    struct task *t = task_for_pid(pid, 1);
     if (!t)
         return CALL_FUNC(getsid, pid);
+    pid_t sid = t->tsk_sid;
+    task_unlock(t);
 
-    return t->tsk_sid;
+    return sid;
 }
 
 int setpgid(pid_t pid, pid_t pgid)
@@ -4261,54 +4359,25 @@ int setpgid(pid_t pid, pid_t pgid)
         errno = EINVAL;
         return -1;
     }
+
+    pthread_mutex_lock(&tasks_lock);
+
     if (!pid)
         pid = current->tsk_pid;
     
-    struct task *t = task_for_pid(pid);
-    if (!t)
-        return CALL_FUNC(setpgid, pid, pgid);
-
     if (!pgid)
         pgid = pid;
 
-    task_lock(t);
-
-    if (t->tsk_pid == t->tsk_sid) {
-        task_unlock(t);
-        errno = EPERM;
-        return -1;
+    struct task *t = task_for_pid(pid, 0);
+    if (!t) {
+        pthread_mutex_unlock(&tasks_lock);
+        return CALL_FUNC(setpgid, pid, pgid);
     }
 
-    pthread_mutex_lock(&tasks_lock);
-    struct task *ct;
-    list_for_each_entry(ct, &main_task->tsk_list, tsk_list)
-    {
-        if (pgid == ct->tsk_pgid)
-        {
-            if (pid == ct->tsk_pid || t->tsk_sid != ct->tsk_sid) {
-                errno = EPERM;
-                pthread_mutex_unlock(&tasks_lock);
-                task_unlock(t);
-                return -1;
-            }
-
-            pthread_mutex_unlock(&tasks_lock);
-            task_unlock(t);
-            t->tsk_pgid = ct->tsk_pgid;
-            return 0;
-        }
-    }
-    pthread_mutex_unlock(&tasks_lock);
-
-    if (pid != pgid) {
-        errno = ESRCH;
-        task_unlock(t);
-        return -1;
-    }
-
-    t->tsk_pgid = pgid;
+    int ret = task_set_pgid(t, pgid);
     task_unlock(t);
-    return 0;
+    pthread_mutex_unlock(&tasks_lock);
+    return ret;
 }
 
 pid_t getpgid(pid_t pid)
@@ -4319,11 +4388,13 @@ pid_t getpgid(pid_t pid)
     if (!pid)
         pid = current->tsk_pid;
     
-    struct task *t = task_for_pid(pid);
+    struct task *t = task_for_pid(pid, 1);
     if (!t)
         return CALL_FUNC(getpgid, pid);
     
-    return t->tsk_pgid;
+    pid_t pgid = t->tsk_pgid;
+    task_unlock(t);
+    return pgid;
 }
 
 pid_t getpgrp(void)
@@ -4393,46 +4464,12 @@ int kill(pid_t pid, int sig) {
     
     if (pid == 0) {
         task_lock(current);
-        pid = current->tsk_pgid;
+        pid = -current->tsk_pgid;
         task_unlock(current);
 
         // should be positive but not 1 (-1 isn't want we would like to call kill with)
-        if (pid <= 1)
+        if (pid >= -1)
             panic("kill self pgid (%d)", pid);
-        
-        return kill(-pid, sig);
-    }
-
-    // handle single target process
-    if (pid > 0) {
-
-        // special case: kill to self
-        if (pid == current->tsk_pid)
-            return raise(sig);
-
-        struct task *t;
-        // special case: kill an external process to the tvm
-        if (!(t = task_for_pid(pid)))
-            return CALL_FUNC(kill, pid, sig);
-
-        task_lock(t);
-        if (t->tsk_state & TS_ZOMBIE) {
-            task_unlock(t);
-            errno = ESRCH;
-            return -1;
-        }
-
-        int r = task_kill_locked(t, sig);
-        if (r == ESRCH)
-            panic("kill(%d) no threads?", pid);
-        task_unlock(t);
-
-        if (r != 0) {
-            errno = r;
-            r = -1;
-        }
-
-        return r;
     }
 
     // Kill all processes with permissions not supported
@@ -4441,72 +4478,42 @@ int kill(pid_t pid, int sig) {
         return -1;
     }
 
-    // Kill all processes in process group, pid is -pgid
-
     int self = 0;
     int ntasks = 0;
-    struct task **tasks = NULL;
+    int kills_confirmed = 0;
     
-    task_lock(current);
     pthread_mutex_lock(&tasks_lock);
     struct task *t;
     list_for_each_entry(t, &main_task->tsk_list, tsk_list) {
-        if (t->tsk_pgid == -pid) {
+        if (t->tsk_pid == pid || t->tsk_pgid == -pid) {
             if (t == current) {
                 self = 1;
                 continue;
             }
 
-            struct task **new_tasks = malloc(sizeof(struct task *) * (ntasks + 1));
-            if (!new_tasks) {
-                for (int i = 0; i < ntasks; i++)
-                    task_unlock(tasks[i]);
-                free(tasks);
-                errno = ENOMEM;
-                return -1;
-            }
-
-            task_lock(t);
-            memmove(new_tasks, tasks, sizeof(struct task *) * ntasks);
-            new_tasks[ntasks] = t;
-            free(tasks);
-            tasks = new_tasks;
             ntasks++;
+            task_lock(t);
+            if (t->tsk_state & TS_ZOMBIE)
+                errno = ESRCH;
+            else if (0 == task_kill_locked(t, sig))
+                kills_confirmed++;
+            task_unlock(t);
         }
     }
     pthread_mutex_unlock(&tasks_lock);
 
-    if (!self) {
-        task_unlock(current);
-
-        if (!ntasks) {
-            errno = ESRCH;
-            return -1;
-        }
+    if (!self && !ntasks) {
+        errno = ESRCH;
+        return -1;
     }
     
-    int one_ok = 0;
-    for (int i = 0; i < ntasks; i++) {
-        int r = task_kill_locked(tasks[i], sig);
-        if (0 == r)
-            one_ok = 1;
-        else
-            errno = r;
-    }
-
-    for (int i = 0; i < ntasks; i++)
-        task_unlock(tasks[i]);
-    
+    // must save self for last because if we die from the signal, we miss some of the target recipients
     if (self) {
-        int r = task_kill_locked(current, sig);
-        if (0 == r)
-            one_ok = 1;
-        else
-            errno = r;
-        task_unlock(current);
+        if (0 == raise(sig))
+            kills_confirmed++;
     }
 
-    return (one_ok ? 0 : -1);
+    return (kills_confirmed ? 0 : -1);
 }
 
 char *getenv(const char *name)
