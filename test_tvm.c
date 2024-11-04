@@ -53,6 +53,8 @@ static int             test_phase_value = 0;
     } while (0)
 #define PHASE test_phase_value
 
+#define PHASE_INC() PHASE_SET(test_phase_value+1)
+
 //////////
 //// Tests
 //////////
