@@ -14,11 +14,16 @@ What started as a small project to statically compile [dropbear](https://github.
 
 ## Build and run
 
+**macOS:** You need gnu-sed (to build toybox), just run `$ brew install gnu-sed`.
+
 To build, just run `$ make`.
 
 To run, `$ ./forkless` and an SSH server at port 2222 will start running with user:password `user:alpine`.
 
-You may also ensure tests are passing by running `$ make test && ./test_forkless`.
+#### Tests
+
+- **tvm tests**: for testing the vm specifically, build and run with `$ make test && ./test_tvm`.
+- **forkless tests**: for testing `dropbear`+`mksh`+`toybox` over the tvm with **pytest**. You need to `$ pip install pytest pexpect` and then run `$ make && pytest test_forkless.py`.
 
 ## Current Features
 
