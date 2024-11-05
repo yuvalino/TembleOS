@@ -1236,6 +1236,8 @@ static void terminate_current_locked(int result)
         task_unlock(parent);
     }
 
+    // if this is before the pthread_cond_signal, a not-that-rare deadlock occurs in stress tests on unlocked mutex of parent.
+    // not sure why, nor gonna figure this out now
     pthread_mutex_unlock(&tasks_lock);
 
     CALL_FUNC(pthread_exit, 0);
