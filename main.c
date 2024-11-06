@@ -50,6 +50,7 @@ void xxd(void *addr, int len)
 }
 
 int mksh_main(int argc, char **argv);
+int ash_main(int argc, char **argv);
 int dropbear_main(int argc, char **argv);
 int scp_main(int argc, char **argv);
 int _toybox_main(int argc, char **argv);
@@ -76,6 +77,7 @@ static void add_toy(const char *toy_name, void *arg)
 int main(int argc, char **argv)
 {
     tvm_init();
+    //tvm_register_program("/bin/sh", (main_func_t) ash_main);
     tvm_register_program("/bin/sh", (main_func_t) mksh_main);
     tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
     tvm_register_program("/usr/bin/toybox", (main_func_t) _toybox_main);

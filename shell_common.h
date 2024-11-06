@@ -19,12 +19,12 @@
 #ifndef SHELL_COMMON_H
 #define SHELL_COMMON_H 1
 
-PUSH_AND_SET_FUNCTION_VISIBILITY_TO_HIDDEN
+#include "platform.h"
 
-extern const char defifsvar[] ALIGN1; /* "IFS= \t\n" */
+const char defifsvar[] ALIGN1 = "IFS= \t\n";
 #define defifs (defifsvar + 4)
 
-extern const char defoptindvar[] ALIGN1; /* "OPTIND=1" */
+const char defoptindvar[] ALIGN1 = "OPTIND=1";
 
 int FAST_FUNC is_well_formed_var_name(const char *s, char terminator);
 
@@ -48,6 +48,6 @@ shell_builtin_read(void FAST_FUNC (*setvar)(const char *name, const char *val),
 int FAST_FUNC
 shell_builtin_ulimit(char **argv);
 
-POP_SAVED_FUNCTION_VISIBILITY
+#  define ARRAY_SIZE(a)  sizeof(a)/sizeof(*a)
 
 #endif

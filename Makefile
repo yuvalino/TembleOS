@@ -1,4 +1,4 @@
-.PHONY: first all clean mksh forkless dropbear dummy toybox
+.PHONY: first all clean mksh forkless dropbear dummy toybox ash
 
 first: all
 
@@ -18,8 +18,8 @@ clean:
 	@rm dropbear/Makefile || true
 	@rm mksh/Rebuild.sh || true
 
-forkless: dropbear mksh toybox
-	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+forkless: dropbear mksh toybox ash
+	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox ash.o -lz -lpthread -lutil $(LDFLAGS)
 
 test:
 	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
@@ -39,3 +39,6 @@ toybox:
 
 dummy:
 	@gcc dummy/dummy.c -c -o /tmp/dummy.o
+
+ash: 
+	gcc ash.c -g -Wno-format-security -Wno-format -c -o ash.o
