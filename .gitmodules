@@ -1,9 +1,9 @@
 [submodule "dropbear"]
-	path = dropbear
+	path = vendor/dropbear
 	url = git@github.com:yuvalino/dropbear-forkless.git
 [submodule "mksh"]
-	path = mksh
+	path = vendor/mksh
 	url = git@github.com:yuvalino/mksh-forkless.git
 [submodule "toybox"]
-	path = toybox
+	path = vendor/toybox
 	url = git@github.com:yuvalino/toybox-forkless.git
