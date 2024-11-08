@@ -27,7 +27,7 @@ jobs:
     - name: make
       run: make -j
     - name: test
-      run: pytest -v ./test_forkless.py
+      run: pytest -v ./tests/test_forkless.py
   tvm-test:
     strategy:
       matrix:

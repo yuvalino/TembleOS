@@ -16,7 +16,7 @@ DROPBEAR 	:= vendor/dropbear
 MKSH		:= vendor/mksh
 TOYBOX		:= vendor/toybox		
 
-TVM_INCLUDE	:= $(realpath .)
+TVM_INCLUDE	:= $(realpath .)/tvm/include
 
 clean:
 	@make -C $(DROPBEAR) clean || true
@@ -26,10 +26,10 @@ clean:
 	@rm $(MKSH)/Rebuild.sh || true
 
 forkless: dropbear mksh toybox
-	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+	gcc -g -rdynamic -I$(TVM_INCLUDE) tvm/src/tvm.c tvm/src/main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
 
 test:
-	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
+	gcc -g -rdynamic -I$(TVM_INCLUDE) tvm/src/tvm.c tests/test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
 
 mksh:
 	if [ -f $(MKSH)/Rebuild.sh ]; then cd $(MKSH) && sh ./Rebuild.sh; else cd $(MKSH) && CFLAGS="-g -I$(TVM_INCLUDE) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
