@@ -11,8 +11,10 @@ target_link_libraries(forkless
     dropbear
     mksh
     toybox
-    z
+    crypt
     pthread
     util
     m
+    z
 )
+target_include_directories(forkless PRIVATE ${TVM_INCLUDE})
