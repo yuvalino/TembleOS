@@ -50,6 +50,7 @@ ExternalProject_Add(extern_dropbear
     BINARY_DIR          dropbear-build
     CONFIGURE_COMMAND   ${CMAKE_COMMAND} -E env CFLAGS=${DROPBEAR_CFLAGS} ${DROPBEAR_DIR}/configure
     COMMAND             ${CMAKE_COMMAND} -E echo ${DROPBEAR_DUMMY_PROGRAM} > tmp_dummy.c
+    COMMAND             cp ${DROPBEAR_DIR}/localoptions.h localoptions.h
     COMMAND             $(CC) tmp_dummy.c -c -o tmp_dummy.o
     BUILD_COMMAND       ${CMAKE_COMMAND} -E env PROGRAMS=${DROPBEAR_PROGRAMS} $(MAKE) MULTI=1 LDFLAGS=${DROPBEAR_LDFLAGS}
     COMMAND             ${CMAKE_COMMAND} -E env sh -c "find . -name '*.o' | xargs ${CMAKE_AR} rcs libdropbear.a"
