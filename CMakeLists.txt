@@ -1,24 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(tvm)
 
-file(GLOB_RECURSE TVM_SOURCES ${CMAKE_CURRENT_LIST_DIR}/tvm/src/**.c)
 set(TVM_INCLUDE ${CMAKE_CURRENT_LIST_DIR}/tvm/include)
 
 add_subdirectory(vendor)
+add_subdirectory(tvm)
+add_subdirectory(forkless)
 
-add_executable(forkless ${TVM_SOURCES})
-target_include_directories(forkless PRIVATE ${TVM_INCLUDE})
+option(BUILD_TESTS "Build Tests" OFF)
 
-target_link_libraries(forkless
-    dropbear
-    mksh
-    toybox
-    pthread
-    util
-    m
-    z
-)
-
-if (UNIX)
-    target_link_libraries(forkless crypt)
-endif (UNIX)
+if (BUILD_TESTS)
+    add_subdirectory(tests)
+endif (BUILD_TESTS)

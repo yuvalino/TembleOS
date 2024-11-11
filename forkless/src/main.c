@@ -8,47 +8,6 @@
 #include <sys/wait.h>
 #include <signal.h>
 
-void xxd(void *addr, int len)
-{
-    char *caddr = (char *) addr;
-    int off = 0;
-    while (off < len)
-    {
-        size_t start_off = off;
-
-        char currptr[17];
-        printf("%08x: ", off);
-
-        memset(currptr, ' ', sizeof(currptr)-1); currptr[sizeof(currptr)-1] = 0;
-        for (int i = 0; off < len, i < 8; off++, i++) {
-            char a[3];
-            snprintf(a, 3, "%02hhx", caddr[off]);
-            memcpy(currptr + (2*(7-i)), a, 2);
-        }
-        printf("%s", currptr);
-
-        printf(" ");
-
-        memset(currptr, ' ', sizeof(currptr)-1);
-        if (off < len) {
-            for (int i = 0; off < len, i < 8; off++, i++) {
-                char a[3];
-                snprintf(a, 3, "%02hhx", caddr[off]);
-                memcpy(currptr + (2*(7-i)), a, 2);
-            }
-        }
-        printf("%s", currptr);
-
-        printf("  ");
-
-        for (; start_off < off; start_off++) {
-            printf("%c", (isprint(caddr[start_off]))?caddr[start_off]:'.');
-        }
-
-        printf("\n");
-    }
-}
-
 int mksh_main(int argc, char **argv);
 int dropbear_main(int argc, char **argv);
 int scp_main(int argc, char **argv);
