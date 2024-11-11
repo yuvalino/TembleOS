@@ -12,30 +12,37 @@ ifeq ($(UNAME_S), Darwin)
 	LDFLAGS +=
 endif
 
+DROPBEAR 	:= vendor/dropbear
+MKSH		:= vendor/mksh
+TOYBOX		:= vendor/toybox		
+
+TVM_INCLUDE	:= $(realpath .)/tvm/include
+
 clean:
-	@make -C dropbear/ clean || true
-	@make -C toybox/ clean || true
-	@rm dropbear/Makefile || true
-	@rm mksh/Rebuild.sh || true
+	@make -C $(DROPBEAR) clean || true
+	@make -C $(MKSH) clean || true
+	@make -C $(TOYBOX) clean || true
+	@rm $(DROPBEAR)/Makefile || true
+	@rm $(MKSH)/Rebuild.sh || true
 
 forkless: dropbear mksh toybox
-	gcc -g -rdynamic -I. tvm.c main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
+	gcc -g -rdynamic -I$(TVM_INCLUDE) tvm/src/tvm.c tvm/src/main.c -o forkless -L . -ldropbear -lmksh -ltoybox -lz -lpthread -lutil $(LDFLAGS)
 
 test:
-	gcc -g -rdynamic -I. tvm.c test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
+	gcc -g -rdynamic -I$(TVM_INCLUDE) tvm/src/tvm.c tests/test_tvm.c -o test_tvm -lpthread $(LDFLAGS)
 
 mksh:
-	if [ -f mksh/Rebuild.sh ]; then cd mksh && sh ./Rebuild.sh; else cd mksh && CFLAGS="-g -I$(realpath .) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
-	find mksh/ -type f -name '*.o' | xargs ar rcs libmksh.a
+	if [ -f $(MKSH)/Rebuild.sh ]; then cd $(MKSH) && sh ./Rebuild.sh; else cd $(MKSH) && CFLAGS="-g -I$(TVM_INCLUDE) -DMKSH_FORKLESS=1" sh ./Build.sh; fi
+	find $(MKSH) -type f -name '*.o' | xargs ar rcs libmksh.a
 
 dropbear: dummy
-	if [ ! -f dropbear/Makefile ]; then cd dropbear && CFLAGS="-g -I$(realpath .)" ./configure; fi
-	make -C dropbear/ PROGRAMS="dropbear scp" MULTI=1 LDFLAGS="/tmp/dummy.o -o /tmp/dummy.out && echo"
-	find dropbear/ -type f -name '*.o' | xargs ar rcs libdropbear.a
+	if [ ! -f $(DROPBEAR)/Makefile ]; then cd $(DROPBEAR) && CFLAGS="-g -I$(TVM_INCLUDE)" ./configure; fi
+	make -C $(DROPBEAR) PROGRAMS="dropbear scp" MULTI=1 LDFLAGS="/tmp/dummy.o -o /tmp/dummy.out && echo"
+	find $(DROPBEAR) -type f -name '*.o' | xargs ar rcs libdropbear.a
 
 toybox:
-	CFLAGS="-g -I$(realpath .) -DTOYBOX_FORKLESS=1" V=1 make -C toybox
-	find toybox/ -type f -name '*.o' | xargs ar rcs libtoybox.a
+	CFLAGS="-g -I$(TVM_INCLUDE) -DTOYBOX_FORKLESS=1" V=1 make -C $(TOYBOX)
+	find $(TOYBOX) -type f -name '*.o' | xargs ar rcs libtoybox.a
 
 dummy:
 	@gcc dummy/dummy.c -c -o /tmp/dummy.o

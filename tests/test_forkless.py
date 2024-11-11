@@ -1,3 +1,5 @@
+#!/bin/env python3
+
 import time
 import pytest
 import tempfile
@@ -5,6 +7,7 @@ from dataclasses import dataclass
 from pexpect import spawn, TIMEOUT, EOF
 from contextlib import contextmanager
 from typing import Iterator
+from os import getenv
 
 PASSWORD = "alpine"
 TIMEOUT_SECONDS = 10
@@ -17,8 +20,9 @@ class Forkless:
 
 @pytest.fixture()
 def forkless() -> Iterator[Forkless]:
+    forkless_path = getenv("FORKLESS_PATH")
     port = 2222
-    with spawn(f"./forkless {port}", timeout=TIMEOUT_SECONDS) as p: 
+    with spawn(f"{forkless_path} {port}", timeout=TIMEOUT_SECONDS) as p: 
         assert p.expect([TIMEOUT, ".* Not backgrounding"])
         yield Forkless(p, 'localhost', port)
 
