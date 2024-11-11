@@ -15,6 +15,6 @@ target_link_libraries(${PROJECT_NAME}
     z
 )
 
-if (UNIX)
+if (NOT APPLE)
     target_link_libraries(${PROJECT_NAME} crypt)
-endif (UNIX)
+endif (NOT APPLE)

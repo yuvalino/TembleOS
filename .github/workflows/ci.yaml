@@ -44,6 +44,6 @@ jobs:
       with:
         build-dir: build
         options: |
-          BUILD_TESTS=ON
+          BUILD_TESTS=1
     - name: test
       run: ./build/tests/tvm_test
