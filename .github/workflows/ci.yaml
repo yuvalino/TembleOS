@@ -29,7 +29,7 @@ jobs:
       with:
         build-dir: build
     - name: test
-      run: FORKLESS_PATH=./build/forkless pytest -v ./tests/test_forkless.py
+      run: FORKLESS_PATH=./build/forkless/forkless pytest -v ./tests/test_forkless.py
   tvm-test:
     strategy:
       matrix:
@@ -39,5 +39,11 @@ jobs:
     - uses: actions/checkout@v4
       with:
         submodules: 'true'
+    - name: cmake
+      uses: threeal/cmake-action@v2.0.0
+      with:
+        build-dir: build
+        options: |
+          BUILD_TESTS=ON
     - name: test
-      run: make test -j && ./test_tvm
+      run: ./build/tests/tvm_test
