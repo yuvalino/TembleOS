@@ -7,14 +7,18 @@ set(TVM_INCLUDE ${CMAKE_CURRENT_LIST_DIR}/tvm/include)
 add_subdirectory(vendor)
 
 add_executable(forkless ${TVM_SOURCES})
+target_include_directories(forkless PRIVATE ${TVM_INCLUDE})
+
 target_link_libraries(forkless
     dropbear
     mksh
     toybox
-    crypt
     pthread
     util
     m
     z
 )
-target_include_directories(forkless PRIVATE ${TVM_INCLUDE})
+
+if (UNIX)
+    target_link_libraries(forkless crypt)
+endif (UNIX)
