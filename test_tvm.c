@@ -605,6 +605,57 @@ TEST(FDsFcntl) {
     ASSERT_EQ(nf2, 11);
 }
 
+TEST(FDsDup) {
+    
+    int in_msg;
+    int msg1 = 0xAAAABBBB;
+    int msg2 = 0xCCCCDDDD;
+    int msg3 = 0x11112222;
+    int msg4 = 0x33334444;
+
+    int pp[2] = {-1, -1};
+    ASSERT_EQ(0, pipe(pp));
+
+    pid_t p = fork();
+    ASSERT_NEQ(p, -1);
+
+    if (!p) {
+        ASSERT_EQ(0, close(pp[0]));
+        ASSERT_EQ(4, write(pp[1], &msg1, 4));
+        ASSERT_EQ(1, dup2(pp[1], 1));
+        ASSERT_EQ(4, write(pp[1], &msg2, 4));
+        ASSERT_EQ(4, write(1, &msg3, 4));
+        ASSERT_EQ(4, fwrite(&msg4, 1, 4, stdout));
+
+        _exit(0);
+    }
+
+    ASSERT_EQ(0, close(pp[1]));
+
+    ASSERT_EQ(4, read(pp[0], &in_msg, 4));
+    ASSERT_EQ(0, memcmp(&msg1, &in_msg, 4));
+
+    ASSERT_EQ(4, read(pp[0], &in_msg, 4));
+    ASSERT_EQ(0, memcmp(&msg2, &in_msg, 4));
+    ASSERT_EQ(4, read(pp[0], &in_msg, 4));
+    ASSERT_EQ(0, memcmp(&msg3, &in_msg, 4));
+
+    ASSERT_EQ(4, read(pp[0], &in_msg, 4));
+    ASSERT_EQ(0, memcmp(&msg4, &in_msg, 4));
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 0);
+}
+
+TEST(FILEStreams) {
+    FILE *fp = fopen("/dev/null", "w");
+    ASSERT_NEQ(NULL, fp);
+
+    ASSERT_EQ(3, fileno(fp));
+}
+
 static COW_IMPL(int, cow_int);
 
 TEST(COWSingleThreaded) {
@@ -1050,6 +1101,42 @@ TEST(TTYDetachTIOCNOTTY) {
     ASSERT_EQ(WEXITSTATUS(s), 0);
 }
 
+#define STRESS_PROC_COUNT 500
+TEST(StressProc) {
+    int p;
+    for (int i = 0; i < STRESS_PROC_COUNT; i++) {
+        p = fork();
+        ASSERT_NEQ(p, -1);
+        if (!p) {
+            printf("break %d\n", getpid());
+            break;
+        }
+        printf("%d forked %d\n", getpid(), p);
+    }
+
+    if (!p) {
+        printf("child enter %d\n", getpid());
+        PHASE_INC();
+        printf("child wait %d %d\n", getpid(), PHASE);
+        PHASE_WAIT(STRESS_PROC_COUNT);
+        exit(0);
+    }
+
+    printf("okay\n");
+    PHASE_WAIT(STRESS_PROC_COUNT-1);
+
+    printf("lets go\n");
+    PHASE_INC();
+
+    for (int i = 0; i < STRESS_PROC_COUNT; i++) {
+        ASSERT_NEQ(-1, wait(NULL));
+    }
+
+    // all children reaped
+    ASSERT_EQ(-1, waitpid(-1, NULL, WNOHANG));
+    printf("done\n");
+}
+
 //////////
 //// Framework
 //////////
@@ -1353,7 +1440,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!in_gdb)
+    if (!in_gdb && !verbose)
         printf("tvm ");
         
     int r = 0, i = 0;
@@ -1371,13 +1458,22 @@ int main(int argc, char **argv)
         }
 
         if (!in_gdb) {
+            if (verbose)
+                printf("tvm::%s ", tests[i].n);
+            
             r = runtest(tests + i, verbose);
             if (r) {
-                printf((r>0)?"F":"C");
+                if (verbose)
+                    printf("%s\n", (r>0)?"FAILED":"CRASH");
+                else
+                    printf((r>0)?"F":"C");
                 break;
             }
             else {
-                printf(".");
+                if (verbose)
+                    printf(".\n");
+                else
+                    printf(".");
             }
         }
         else {

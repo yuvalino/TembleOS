@@ -8,6 +8,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <poll.h>
 #include <unistd.h>
 #include <errno.h>
@@ -29,6 +30,7 @@
 #include <grp.h>
 #include <signal.h>
 #include <dirent.h>
+
 
 #if defined(__APPLE__)
 #include <util.h>
@@ -198,11 +200,16 @@ struct original_func_t {
 
 static LIST_HEAD(original_functions);
 
+DECL_FUNC(fopen);
 DECL_FUNC(fdopen);
+DECL_FUNC(fclose);
+DECL_FUNC(freopen);
+DECL_FUNC(popen);
+DECL_FUNC(pclose);
+DECL_FUNC(tmpfile);
 DECL_FUNC(fdopendir);
 DECL_FUNC(fwrite);
 DECL_FUNC(fread);
-DECL_FUNC(fclose);
 DECL_FUNC(fseek);
 DECL_FUNC(ftell);
 DECL_FUNC(fflush);
@@ -224,6 +231,8 @@ DECL_FUNC(clearerr);
 DECL_FUNC(feof);
 DECL_FUNC(ferror);
 DECL_FUNC(fileno);
+DECL_FUNC(getline);
+DECL_FUNC(getdelim);
 
 DECL_FUNC(printf);
 DECL_FUNC(fprintf);
@@ -515,6 +524,13 @@ err:
     return ret;
 }
 #endif
+
+static uint64_t time_us()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_usec + tv.tv_sec * 1000000;
+}
 
 /////////////
 // Jmpbuf manipulation
@@ -813,9 +829,183 @@ static char **findenv(char **env, const char *name, size_t name_len)
 struct fops;
 struct task;
 
+static int t_fd(int fd);
+
 struct fops *fops_for_fd_locked(struct task *t, int fd);
 int fops_fdflag(struct fops *fops);
-int fops_dup(struct fops *fops, int oldfd, int newfd);
+void fops_dup(struct fops *fops, int oldfd);
+
+/////////////
+// Streams
+/////////////
+
+#define FILESTREAM_MAGIC 0xFACEFACD
+
+struct filestream {
+    unsigned fs_magic;
+    FILE *fs_fp;
+    pthread_mutex_t fs_mtx;
+    int fs_usage;
+    int fs_oldfd;
+};
+
+static int filestream_fileno_offset = -1;
+
+static void filestream_init()
+{
+    // find offset of file descriptor in FILE by opening a few files and xref'ing each FILE for its fd value
+
+    struct { int fd; FILE *f; } files[10];
+    int *off_arr = NULL;
+    int off_n = 0;
+
+    for (int i = 0; i < (sizeof(files)/sizeof(*files)); i++) {
+        if (!(files[i].f = CALL_FUNC(fopen, "/dev/null", "w")))
+            panic("fopen(\"/dev/null\") failed (%d)", i);
+        if (0 > (files[i].fd = CALL_FUNC(fileno, files[i].f)))
+            panic("fileno(\"/dev/null\") failed (%d)", i);
+    }
+
+    // find all possible offsets in first file into `off_arr`/`off_n`
+    char *data = (char *)files[0].f;
+    for (int idx = 0; (idx+4) < 0x100; idx++) {
+        char *curr = data + idx;
+        int *curri = (int *)curr;
+        
+        if (*curri != files[0].fd)
+            continue;
+        
+        if (!(off_arr = CALL_FUNC(realloc, off_arr, 4 * (off_n + 1))))
+            panic("oom");
+        
+        off_arr[off_n] = idx;
+        off_n++;
+    }
+
+    // filter against all other files
+    for (int i = 1; i < (sizeof(files)/sizeof(*files)); i++) {
+        for (int off_i = 0; off_i < off_n;) {
+            if (files[i].fd == *((int *)(((char *) files[i].f) + off_arr[off_i]))) {
+                off_i++;
+                continue;
+            }
+
+            off_n--;
+            if (off_i < off_n)
+                off_arr[off_i] = off_arr[off_n];
+            
+            if (!(off_arr = CALL_FUNC(realloc, off_arr, 4 * off_n)))
+                panic("oom smaller");
+        }
+    }
+
+    if (off_n != 1)
+        panic("single fileno offset not found (%d)", off_n);
+
+    filestream_fileno_offset = off_arr[0];
+
+    for (int i = 0; i < (sizeof(files)/sizeof(*files)); i++) {
+        if (0 != CALL_FUNC(fclose, files[i].f))
+            panic("fclose");
+    }
+    CALL_FUNC(free, off_arr);
+}
+
+static int fmodetoflags(const char *mode)
+{
+	int m, o;
+
+	switch (*mode++) {
+	case 'r':
+		m = O_RDONLY;
+		o = 0;
+		break;
+	case 'w':
+		m = O_WRONLY;
+		o = O_CREAT | O_TRUNC;
+		break;
+	case 'a':
+		m = O_WRONLY;
+		o = O_CREAT | O_APPEND;
+		break;
+	default:
+		errno = EINVAL;
+		return (0);
+	}
+
+	while (*mode != '\0') {
+		switch (*mode++) {
+		case 'b':
+			break;
+		case '+':
+			m = O_RDWR;
+			break;
+		case 'e':
+			o |= O_CLOEXEC;
+			break;
+		case 'x':
+			if (o & O_CREAT)
+				o |= O_EXCL;
+			break;
+		default:
+			break;
+		}
+    }
+
+	return m | o;
+}
+
+static void setfileno(FILE *stream, int fd)
+{
+    if (filestream_fileno_offset == -1)
+        panic("no filestream_fileno_offset");
+    
+    *((int *) (((uintptr_t) stream) + filestream_fileno_offset)) = fd;
+}
+
+static struct filestream *filestreamalloc(FILE *fp)
+{
+    struct filestream *fs = CALL_FUNC(malloc, sizeof(struct filestream));
+    if (!fs)
+        return NULL;
+    
+    if (0 != pthread_mutex_init(&fs->fs_mtx, NULL)) {
+        free(fs);
+        return NULL;
+    }
+
+    fs->fs_magic = FILESTREAM_MAGIC;
+    fs->fs_fp = fp;
+    fs->fs_usage = 0;
+    fs->fs_oldfd = -1;
+    return fs;
+}
+
+static void filestreamenter(struct filestream *fs)
+{
+    if (fs->fs_magic != FILESTREAM_MAGIC)
+        panic("not a filestream %p", fs);
+    
+    pthread_mutex_lock(&fs->fs_mtx);
+    if (!(fs->fs_usage++)) {
+        fs->fs_oldfd = CALL_FUNC(fileno, fs->fs_fp);
+        setfileno(fs->fs_fp, t_fd(fs->fs_oldfd));
+    }
+    pthread_mutex_unlock(&fs->fs_mtx);
+}
+
+static void filestreamexit(struct filestream *fs)
+{
+    if (fs->fs_magic != FILESTREAM_MAGIC)
+        panic("not a filestream %p", fs);
+    
+    pthread_mutex_lock(&fs->fs_mtx);
+    if (!(--fs->fs_usage)) {
+        setfileno(fs->fs_fp, fs->fs_oldfd);
+        fs->fs_oldfd = -1;
+    }
+    pthread_mutex_unlock(&fs->fs_mtx);
+}
 
 /////////////
 // Task
@@ -873,7 +1063,7 @@ struct task {
     int tsk_result;  // wstatus as returned from `waitpid()`
     pthread_mutex_t tsk_lock;
     int tsk_fd[MAX_FILES];
-    FILE *tsk_f[3];
+    struct filestream *tsk_fs[3];
     int tsk_state;
     pthread_cond_t tsk_wait_cond;
     struct sigaction tsk_sighandlers[MAX_SIGNALS];
@@ -969,7 +1159,7 @@ static struct task *taskalloc()
     for (int i = 0; i < MAX_FILES; i++)
         t->tsk_fd[i] = -1;
     for (int i = 0; i < 3; i++)
-        t->tsk_f[i] = NULL;
+        t->tsk_fs[i] = NULL;
 
     
     if (main_pthread == pthread_self() && !current) {
@@ -978,9 +1168,10 @@ static struct task *taskalloc()
         t->tsk_sid = t->tsk_pgid = t->tsk_pid;
         for (int i = 0; i < 3; i++)
             t->tsk_fd[i] = i;
-        t->tsk_f[0] = stdin;
-        t->tsk_f[1] = stdout;
-        t->tsk_f[2] = stderr;
+        for (int i = 0; i < 3; i++) {
+            if (!(t->tsk_fs[i] = filestreamalloc((!i) ? stdin : ((i==1) ? stdout : stderr))))
+                panic("filestreamalloc");
+        }
 
         t->tsk_environ = copyenv(environ);
         if (!t->tsk_environ)
@@ -1015,15 +1206,15 @@ static struct task *taskalloc()
             
             struct fops *fops = fops_for_fd_locked(current, i);
             t->tsk_fd[i] |= fops_fdflag(fops);
-            if (0 != fops_dup(fops, t_fd(i), newfd)) {
-                CALL_FUNC(close, newfd);
-                panic("taskalloc::f_dup");
-            }
+            fops_dup(fops, t_fd(i));
         }
         for (int i = 0; i < 3; i++) {
-            t->tsk_f[i] = CALL_FUNC(fdopen, t->tsk_fd[i] & ~TFD_MASK, (i?"w":"r"));
-            if (!t->tsk_f[i])
-                panic("taskalloc::fdopen");
+            FILE *fp = CALL_FUNC(fdopen, t->tsk_fd[i] & ~TFD_MASK, (i?"w":"r"));
+            if (!fp)
+                panic("taskalloc::fdopen(%d %d)", i, t->tsk_fd[i]);
+            setfileno(fp, i);
+            if (!(t->tsk_fs[i] = filestreamalloc(fp)))
+                panic("taskalloc::filestreamalloc(%d %d)", i, t->tsk_fd[i]);
         }
 
         memcpy(t->tsk_sighandlers, t->tsk_parent->tsk_sighandlers, sizeof(t->tsk_sighandlers));
@@ -1073,12 +1264,22 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
         pthread_mutex_lock(&tasks_lock);
 
     for (int i = 0; i < 3; i++) {
-        if (t->tsk_f[i] != NULL)
-            CALL_FUNC(fclose, t->tsk_f[i]);
+        if (t->tsk_fs[i] != NULL && t->tsk_fs[i]->fs_fp != NULL) {
+            t->tsk_fs[i]->fs_usage++;
+            setfileno(t->tsk_fs[i]->fs_fp, t->tsk_fd[i] & ~TFD_MASK);
+            CALL_FUNC(fclose, t->tsk_fs[i]->fs_fp);
+        }
         else if (t->tsk_fd[i] != -1)
             CALL_FUNC(close, t->tsk_fd[i] & ~TFD_MASK);
+        
+        if (t->tsk_fs[i] != NULL) {
+            pthread_mutex_unlock(&t->tsk_fs[i]->fs_mtx);
+            pthread_mutex_destroy(&t->tsk_fs[i]->fs_mtx);
+            free(t->tsk_fs[i]);
+        }
+
         t->tsk_fd[i] = -1;
-        t->tsk_f[i] = NULL;
+        t->tsk_fs[i] = NULL;
     }
 
     for (int i = 3; i < MAX_FILES; i++) {
@@ -1372,21 +1573,19 @@ static void terminate_current_locked(int result)
     __builtin_unreachable();
 }
 
-static FILE *t_f(FILE *f)
+static struct filestream *t_fs(FILE *f)
 {
-    if (!main_task)
-        return f;
+    if (!main_task || !current)
+        panic("t_fs");
     
-    if (!current)
-        panic("t_f");
-
     if (f == stdin)
-        return current->tsk_f[0];
+        return current->tsk_fs[0];
     if (f == stdout)
-        return current->tsk_f[1];
+        return current->tsk_fs[1];
     if (f == stderr)
-        return current->tsk_f[2];
-    return f;
+        return current->tsk_fs[2];
+    
+    return (struct filestream *)f;
 }
 
 /////////////
@@ -1554,7 +1753,7 @@ struct fops {
 
     int (*f_openchk)(const char *pathname);
     int (*f_open)(const char *pathname, int flags, mode_t mode);
-    int (*f_dup)(int oldfd, int newfd);
+    void (*f_dup)(int oldfd);
     int (*f_stat)(int fd, struct stat *st);
     int (*f_chown)(int fd, uid_t owner, gid_t group);
     int (*f_chmod)(int fd, mode_t mode);
@@ -1588,12 +1787,12 @@ int fops_fdflag(struct fops *fops)
     return fops->f_fdflag;
 }
 
-int fops_dup(struct fops *fops, int oldfd, int newfd)
+void fops_dup(struct fops *fops, int oldfd)
 {
     if (!fops || !fops->f_dup)
-        return 0;
+        return;
     
-    return fops->f_dup(oldfd, newfd);
+    return fops->f_dup(oldfd);
 }
 
 struct fops *fops_for_fd_locked(struct task *t, int fd)
@@ -1617,9 +1816,9 @@ struct fops *fops_for_fd(struct task *t, int fd) {
     return f;
 }
 
-struct fops *fops_for_stream(struct task *t, FILE *stream) {
+struct fops *fops_for_stream(struct task *t, struct filestream *stream) {
     task_lock(current);
-    struct fops *f = fops_for_fd_locked(t, t_fdr(fileno(stream), 0));
+    struct fops *f = fops_for_fd_locked(t, t_fdr(CALL_FUNC(fileno, stream->fs_fp), 0));
     task_unlock(current);
     return f;
 }
@@ -1999,14 +2198,13 @@ static int ttyop_open(const char *pathname, int flags, mode_t mode)
     return r_sfd;
 }
 
-static int ttyop_dup(int oldfd, int newfd) {
+static void ttyop_dup(int oldfd) {
     struct tty *tt = tty_for_fd(oldfd, TTM_MASTER);
     if (!tt)
-        return 0;
+        return;
     
     tt->t_refcnt++;
     tty_unlock(tt);
-    return 0;
 }
 
 static int ttyop_stat(int fd, struct stat *st)
@@ -2705,6 +2903,8 @@ struct cow_variable_t {
     char *name; // for debugging purposes
     size_t size;
     int flags;
+
+    unsigned debug_time;
 };
 static LIST_HEAD(cow_variables);
 
@@ -2894,8 +3094,13 @@ static int cow_set_thread_ptrs(void **data, struct cow_deepcopy_ctx *dctx)
     // deep copy on a second pass after the dctx is built
     d = data;
     list_for_each_entry(cow, &cow_variables, list) {
+        uint64_t t = time_us();
         if (cow->flags & COW_DEEPCOPY)
             cow_deepcopy(cow->getptr_fn(), cow->size, dctx);
+        cow->debug_time += (time_us() - t);
+        if ((cow->debug_time / 1000) > 10) {
+            INFO("%s %u", cow->name, cow->debug_time / 1000);
+        }
         d++;
     }
 
@@ -3736,6 +3941,8 @@ static int tvm_main(int argc, char **argv)
 
 void tvm_init(const char *init_comm)
 {
+    filestream_init();
+
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
     strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
@@ -3796,7 +4003,7 @@ static void __panic(const char *msg, const char *file, int line)
 
 /**
  * Oh yeah, there are SOOOO many more functions to hook.
- * Code here mostly re-calls original functions with file-descriptors/streams translated with `t_fd()`/`t_f()`.
+ * Code here mostly re-calls original functions with file-descriptors/streams translated with `t_fd()`/`t_fs()`.
  * Some code redirects the call to userspace device drivers.
  * Some code needs to alter the task-specific file-descriptors/signal-handlers table.
  * Also, handle variadic arguments when passing through... thats a big bummer.
@@ -3806,104 +4013,337 @@ static void __panic(const char *msg, const char *file, int line)
  * - Large-File-Support - `open64()`, `openat64()`, `fopen64()`, `lseek64()` etc (for now just don't compile with it)
  */
 
+FILE *fopen(const char *pathname, const char *mode)
+{
+    if (!main_task)
+        return CALL_FUNC(fopen, pathname, mode);
+    
+    int mode_flags = fmodetoflags(mode);
+    int fd = open(pathname, mode_flags, DEFFILEMODE);
+    if (-1 == fd)
+        return NULL;
+
+    if (mode_flags & O_APPEND)
+        lseek(fd, 0, SEEK_END);
+
+    FILE *fp = fdopen(fd, mode);
+    if (!fp) {
+        close(fd);
+        return NULL;
+    }
+
+    return fp;
+}
+
 FILE *fdopen(int fd, const char *mode)
-{ return CALL_FUNC(fdopen, t_fd(fd), mode); }
+{
+    FILE *fp = CALL_FUNC(fdopen, t_fd(fd), mode);
+    if (!main_task || !fp)
+        return fp;
+    
+    struct filestream *fs = filestreamalloc(fp);
+    if (!fs) {
+        CALL_FUNC(fclose, fp);
+        return NULL;
+    }
+
+    setfileno(fp, fd);
+    return (FILE *)fs;
+}
+
+int fclose(FILE *stream)
+{
+    if (!main_task)
+        return CALL_FUNC(fclose, stream);
+    
+    struct filestream *fs = (struct filestream *)stream;
+    filestreamenter(fs);
+
+    task_lock(current);
+    int rfd = CALL_FUNC(fileno, fs->fs_fp);
+    int fd = t_fdr(rfd, 0);
+    INFO("%d %d", fd, rfd);
+
+    struct fops *f = fops_for_fd_locked(current, fd);
+    if (fd != -1)
+        current->tsk_fd[fd] = -1;
+    task_unlock(current);
+
+    // we had to "detach" the fd from `current` so we can call fops->close with task unlocked
+
+    int r = 0;
+    if (f && f->f_close)
+        r = f->f_close(rfd);
+    
+    if (!r)
+        r = CALL_FUNC(fclose, fs->fs_fp);
+    else
+        CALL_FUNC(fclose, fs->fs_fp);
+    
+    pthread_mutex_destroy(&fs->fs_mtx);
+    fs->fs_magic = 0;
+    free(fs);
+    return r;
+}
+
+FILE *freopen(const char *pathname, const char *mode, FILE *stream)
+{
+    if (!main_task)
+        return CALL_FUNC(freopen, pathname, mode, stream);
+    
+    panic("freopen not supported");
+}
+
+FILE *popen(const char *command, const char *type)
+{
+    if (!main_task)
+        return CALL_FUNC(popen, command, type);
+    
+    panic("popen not supported");
+}
+
+int pclose(FILE *stream)
+{
+    if (!main_task)
+        return CALL_FUNC(pclose, stream);
+    
+    panic("pclose not supported");
+}
+
+FILE *tmpfile(void)
+{
+    if (!main_task)
+        return CALL_FUNC(tmpfile);
+    
+    panic("tmpfile not supported");
+}
 
 DIR *fdopendir(int fd)
 { return CALL_FUNC(fdopendir, t_fd(fd)); }
 
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
-    struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
-        return CALL_FUNC(fwrite, ptr, size, nmemb, t_f(stream));
+    if (!main_task)
+        return CALL_FUNC(fwrite, ptr, size, nmemb, stream);
     
     if (!size)
         return 0;
+
+    struct filestream *fs = t_fs(stream);
+    filestreamenter(fs);
+
+    struct fops *fops;
+    if (!(fops = fops_for_stream(current, fs))) {
+        size_t ret = CALL_FUNC(fwrite, ptr, size, nmemb, fs->fs_fp);
+        filestreamexit(fs);
+        return ret;
+    }
     
-    ssize_t r = fops_write(fops, fileno(stream), ptr, size * nmemb);
+    ssize_t r = fops_write(fops, CALL_FUNC(fileno, fs->fs_fp), ptr, size * nmemb);
     if (r < 0)
         r = 0;
     
+    filestreamexit(fs);
     return r / size;
 }
 
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
-    struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
-        return CALL_FUNC(fread, ptr, size, nmemb, t_f(stream));
+    if (!main_task)
+        return CALL_FUNC(fread, ptr, size, nmemb, stream);
     
     if (!size)
         return 0;
+
+    struct filestream *fs = t_fs(stream);
+    filestreamenter(fs);
+
+    struct fops *fops;
+    if (!(fops = fops_for_stream(current, fs))) {
+        size_t ret = CALL_FUNC(fread, ptr, size, nmemb, fs->fs_fp);
+        filestreamexit(fs);
+        return ret;
+    }
     
-    ssize_t r = fops_read(fops, fileno(stream), ptr, size * nmemb);
+    ssize_t r = fops_read(fops, CALL_FUNC(fileno, fs->fs_fp), ptr, size * nmemb);
     if (r < 0)
         r = 0;
     
+    filestreamexit(fs);
     return r / size;
 }
 
 int fseek(FILE *stream, long offset, int whence)
-{ return CALL_FUNC(fseek, t_f(stream), offset, whence); }
+{
+    if (!main_task)
+        return CALL_FUNC(fseek, stream, offset, whence);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(fseek, stream, offset, whence);
+    filestreamexit(fs);
+    return r;
+}
 
 long ftell(FILE *stream)
-{ return CALL_FUNC(ftell, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(ftell, stream);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(ftell, stream);
+    filestreamexit(fs);
+    return r;
+}
 
 int fflush(FILE *stream)
-{ return CALL_FUNC(fflush, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(fflush, stream);
+    
+    if (NULL == stream)
+        return fflush(stdout) & fflush(stderr);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(fflush, stream);
+    filestreamexit(fs);
+    return r;
+}
 
 void setbuf(FILE *stream, char *buf)
-{ return CALL_FUNC(setbuf, t_f(stream), buf); }
+{
+    if (!main_task)
+        return CALL_FUNC(setbuf, stream, buf);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    CALL_FUNC(setbuf, stream, buf);
+    filestreamexit(fs);
+}
 
 #if defined(__linux__)
 void setbuffer(FILE *stream, char *buf, size_t size)
 #elif defined(__APPLE__)
 void setbuffer(FILE *stream, char *buf, int size)
 #endif
-{ return CALL_FUNC(setbuffer, t_f(stream), buf, size); }
+{
+    if (!main_task)
+        return CALL_FUNC(setbuffer, stream, buf, size);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    CALL_FUNC(setbuffer, stream, buf, size);
+    filestreamexit(fs);
+}
 
 #if defined(__linux__)
 void setlinebuf(FILE *stream)
 #elif defined(__APPLE__)
 int setlinebuf(FILE *stream)
 #endif
-{ return CALL_FUNC(setlinebuf, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(setlinebuf, stream);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+#if defined(__linux__)
+    CALL_FUNC(setlinebuf, stream);
+    filestreamexit(fs);
+#elif defined(__APPLE__)
+    __auto_type r = CALL_FUNC(setlinebuf, stream);
+    filestreamexit(fs);
+    return r;
+#endif
+}
 
 int setvbuf(FILE *stream, char *buf, int mode, size_t size)
-{ return CALL_FUNC(setvbuf, t_f(stream), buf, mode, size); }
+{
+    if (!main_task)
+        return CALL_FUNC(setvbuf, stream, buf, mode, size);
+    
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(setvbuf, stream, buf, mode, size);
+    filestreamexit(fs);
+    return r;
+}
 
 int fputc(int c, FILE *stream)
 {
+    if (!main_task)
+        return CALL_FUNC(fputc, c, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
-        return CALL_FUNC(fputc, c, t_f(stream));
-    
-    if (1 == fops_write(fops, fileno(stream), &c, 1))
-        return c;
-    return EOF;
+    if (!(fops = fops_for_stream(current, fs))) {
+        __auto_type ret = CALL_FUNC(fputc, c, stream);
+        filestreamexit(fs);
+        return ret;
+    }
+
+    if (1 != fops_write(fops, CALL_FUNC(fileno, fs->fs_fp), &c, 1))
+        c = EOF;
+    filestreamexit(fs);
+    return c;
 }
 
 int fputs(const char *s, FILE *stream)
 {
+    if (!main_task)
+        return CALL_FUNC(fputs, s, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
-        return CALL_FUNC(fputs, s, t_f(stream));
-    
-    ssize_t r = fops_write(fops, fileno(stream), s, strlen(s));
-    if (r >= 0)
-        return r;
-    return EOF;
+    if (!(fops = fops_for_stream(current, fs))) {
+        __auto_type ret = CALL_FUNC(fputs, s, stream);
+        filestreamexit(fs);
+        return ret;
+    }
+
+    ssize_t r = fops_write(fops, CALL_FUNC(fileno, fs->fs_fp), s, strlen(s));
+    if (r < 0)
+        r = EOF;
+    filestreamexit(fs);
+    return r;
 }
 
 int putc(int c, FILE *stream)
-{ return fputc(c, stream); }
+{
+    if (!main_task)
+        return CALL_FUNC(putc, c, stream);
+    
+    return fputc(c, stream);
+}
 
 int putchar(int c)
-{ return fputc(c, stdout); }
+{
+    if (!main_task)
+        return CALL_FUNC(putchar, c);
+    
+    return fputc(c, stdout);
+}
 
 int puts(const char *s)
 {
+    if (!main_task)
+        return CALL_FUNC(puts, s);
+    
     if (EOF == fputs(s, stdout))
         return EOF;
     return fputc('\n', stdout);
@@ -3911,27 +4351,48 @@ int puts(const char *s)
 
 int fgetc(FILE *stream)
 {
+    if (!main_task)
+        return CALL_FUNC(fgetc, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+
     struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
-        return CALL_FUNC(fgetc, t_f(stream));
-    
-    char c;
-    if (1 == fops_read(fops, fileno(stream), &c, 1))
-        return (int)c;
-    return EOF;
+    if (!(fops = fops_for_stream(current, fs))) {
+        __auto_type ret = CALL_FUNC(fgetc, stream);
+        filestreamexit(fs);
+        return ret;
+    }
+
+    int c = 0;
+    if (1 != fops_read(fops, CALL_FUNC(fileno, fs->fs_fp), &c, 1))
+        c = EOF;
+    filestreamexit(fs);
+    return c;
 }
 
 char *fgets(char *s, int size, FILE *stream)
 {
-    struct fops *fops;
-    if (!main_task || !(fops = fops_for_stream(current, stream)))
-        return  CALL_FUNC(fgets, s, size, t_f(stream));
-    
+    if (!main_task)
+        return CALL_FUNC(fgets, s, size, stream);
+
     if (size <= 0)
         return NULL;
     if (size == 1) {
         s[0] = 0;
         return s;
+    }
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+
+    struct fops *fops;
+    if (!(fops = fops_for_stream(current, fs))) {
+        __auto_type ret = CALL_FUNC(fgets, s, size, stream);
+        filestreamexit(fs);
+        return ret;
     }
     
     int err = 0;
@@ -3939,7 +4400,7 @@ char *fgets(char *s, int size, FILE *stream)
     char c = 0;
     for (i = 0; i < (size - 1) && c != '\n'; i++)
     {
-        ssize_t r = fops_read(fops, fileno(stream), &c, 1);
+        ssize_t r = fops_read(fops, CALL_FUNC(fileno, fs->fs_fp), &c, 1);
         if (r == -1)
             err = 1;
         if (1 != r)
@@ -3948,6 +4409,7 @@ char *fgets(char *s, int size, FILE *stream)
         s[i] = c;
     }
     
+    filestreamexit(fs);
 
     if (i == 0 && err)
         return NULL;
@@ -3957,27 +4419,112 @@ char *fgets(char *s, int size, FILE *stream)
 }
 
 int getc(FILE *stream)
-{ return fgetc(stream); }
+{
+    if (!main_task)
+        return CALL_FUNC(getc, stream);
+    
+    return fgetc(stream);
+}
 
 int getchar(void)
-{ return fgetc(stdin); }
+{
+    if (!main_task)
+        return CALL_FUNC(getchar);
+    
+    return fgetc(stdin);
+}
 
 int ungetc(int c, FILE *stream)
-{ return CALL_FUNC(ungetc, c, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(ungetc, c, stream);
+    
+    // TODO: support for fops?
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(ungetc, c, stream);
+    filestreamexit(fs);
+    return r;
+}
 
 void clearerr(FILE *stream)
-{ return CALL_FUNC(clearerr, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(clearerr, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    CALL_FUNC(clearerr, stream);
+    filestreamexit(fs);
+}
 
 int feof(FILE *stream)
-{ return CALL_FUNC(feof, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(feof, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(feof, stream);
+    filestreamexit(fs);
+    return r;
+}
 
 int ferror(FILE *stream)
-{ return CALL_FUNC(ferror, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(ferror, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(ferror, stream);
+    filestreamexit(fs);
+    return r;
+}
 
 int fileno(FILE *stream)
-{ return CALL_FUNC(fileno, t_f(stream)); }
+{
+    if (!main_task)
+        return CALL_FUNC(fileno, stream);
 
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = fs->fs_oldfd;
+    filestreamexit(fs);
+    return r;
+}
 
+ssize_t getline(char **lineptr, size_t *n, FILE *stream)
+{
+    if (!main_task)
+        return CALL_FUNC(getline, lineptr, n, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(getline, lineptr, n, stream);
+    filestreamexit(fs);
+    return r;
+}
+
+ssize_t getdelim(char **lineptr, size_t *n, int delim, FILE *stream)
+{
+    if (!main_task)
+        return CALL_FUNC(getdelim, lineptr, n, delim, stream);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type r = CALL_FUNC(getdelim, lineptr, n, delim, stream);
+    filestreamexit(fs);
+    return r;
+}
 
 int printf(const char *format, ...)
 {
@@ -4010,16 +4557,33 @@ int dprintf(int fd, const char *format, ...)
 }
 
 int vprintf(const char *format, va_list ap)
-{ return vfprintf(stdout, format, ap); }
+{
+    if (!main_task)
+        return CALL_FUNC(vprintf, format, ap);
+    
+    return vfprintf(stdout, format, ap);
+}
 
 int vfprintf(FILE *stream, const char *format, va_list ap)
 {
+    if (!main_task)
+        return CALL_FUNC(vfprintf, stream, format, ap);
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+
     struct fops *fops;
-    int fd = t_fdr(fileno(stream), 1);
-    if (!main_task || !(fops = fops_for_fd(current, fd)))
-        return CALL_FUNC(vfprintf, t_f(stream), format, ap);
-    
-    return vdprintf(fd, format, ap);
+    int fd = t_fdr(CALL_FUNC(fileno, stream), 1);
+    if (!(fops = fops_for_fd(current, fd))) {
+        __auto_type ret = CALL_FUNC(vfprintf, stream, format, ap);
+        filestreamexit(fs);
+        return ret;
+    }
+
+    __auto_type r = vdprintf(fd, format, ap);
+    filestreamexit(fs);
+    return r;
 }
 
 int vdprintf(int fd, const char *format, va_list ap)
@@ -4051,7 +4615,7 @@ int scanf(const char *format, ...)
     va_list arg;
     int done;
     va_start (arg, format);
-    done = CALL_FUNC(vfscanf, t_f(stdin), format, arg);
+    done = vfscanf(stdin, format, arg);
     va_end (arg);
     return done;
 }
@@ -4061,16 +4625,33 @@ int fscanf(FILE *stream, const char *format, ...)
     va_list arg;
     int done;
     va_start (arg, format);
-    done = CALL_FUNC(vfscanf, t_f(stream), format, arg);
+    done = vfscanf(stream, format, arg);
     va_end (arg);
     return done;
 }
 
 int vscanf(const char *format, va_list ap)
-{ return CALL_FUNC(vfscanf, t_f(stdin), format, ap); }
+{
+    if (!main_task)
+        return CALL_FUNC(vscanf, format, ap);
+    
+    return vfscanf(stdin, format, ap);
+}
 
 int vfscanf(FILE *stream, const char *format, va_list ap)
-{ return CALL_FUNC(vfscanf, t_f(stream), format, ap); }
+{
+    if (!main_task)
+        return CALL_FUNC(vfscanf, stream, format, ap);
+
+    // TODO support fops?
+
+    struct filestream *fs = t_fs(stream);
+    stream = fs->fs_fp;
+    filestreamenter(fs);
+    __auto_type ret = CALL_FUNC(vfscanf, stream, format, ap);
+    filestreamexit(fs);
+    return ret;
+}
 
 void perror(const char *s)
 {
@@ -4182,6 +4763,7 @@ int close(int fd)
         return CALL_FUNC(close, fd);
     
     task_lock(current);
+    INFO("%d %d", fd, t_fd(fd));
     struct fops *f = fops_for_fd_locked(current, fd);
     int rfd = t_fd(fd);
     if (rfd == -1) {
@@ -4320,14 +4902,7 @@ int dup2(int oldfd, int newfd)
     // TODO from here on theres an inherent race with other threads in the same process
     //      if `fops_dup` fails. maybe we need to proc_fdlock() or smth
 
-    if ((0 != fops_dup(ofops, oldfd_real, newfd_realnext))) {
-        task_lock(current);
-        current->tsk_fd[newfd] = newfd_realprevflags;
-        CALL_FUNC(close, newfd_realnext);
-        task_unlock(current);
-        errno = EFAULT;
-        return -1;
-    }
+    fops_dup(ofops, oldfd_real);
 
     // from here on out, no failures
 
@@ -4492,12 +5067,7 @@ int fcntl(int fd, int cmd, ... /* arg */ )
 
         struct fops *fops = fops_for_fd_locked(current, fd);
         current->tsk_fd[f] |= fops_fdflag(fops);
-        if (0 != fops_dup(fops, t_fd(fd), r)) {
-            CALL_FUNC(close, r);
-            current->tsk_fd[f] = -1;
-            f = -1;
-            errno = EFAULT;
-        }
+        fops_dup(fops, t_fd(fd));
     
         task_unlock(current);
         return f;
