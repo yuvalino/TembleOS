@@ -18,7 +18,7 @@ What started as a small project to statically compile [dropbear](https://github.
 
 To build, just run `$ make`.
 
-To run, `$ ./forkless` and an SSH server at port 2222 will start running with user:password `user:alpine`.
+To run, `$ ./forkless sshd` and an SSH server at port 2222 will start running with user:password `user:alpine`.
 
 #### Tests
 

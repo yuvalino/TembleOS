@@ -18,7 +18,7 @@ class Forkless:
 @pytest.fixture()
 def forkless() -> Iterator[Forkless]:
     port = 2222
-    with spawn(f"./forkless {port}", timeout=TIMEOUT_SECONDS) as p: 
+    with spawn(f"./forkless sshd {port}", timeout=TIMEOUT_SECONDS) as p: 
         assert p.expect([TIMEOUT, ".* Not backgrounding"])
         yield Forkless(p, 'localhost', port)
 

@@ -81,18 +81,59 @@ int main(int argc, char **argv)
     tvm_register_program("/usr/bin/toybox", (main_func_t) _toybox_main);
     toybox_iter_toy_names(add_toy, NULL);
 
-    char *addr_port = (char *)"2222";
-    if (argc >= 2)
-        addr_port = argv[1];
+    if (argc < 2) {
+        fprintf(stderr, "forkless: no command\n");
+        goto err;
+    }
+
+    if (0 == strcmp(argv[1], "-h")) {
+        printf("USAGE: forkless COMMAND\n");
+        printf("VM for sh + ssh\n\n");
+        printf("COMMANDs:\n");
+        printf("  sh   [ARG...]  shell\n");
+        printf("  sshd [PORT]    ssh server\n");
+        printf("\n");
+        printf("Options:\n");
+        printf("  -h             display this help and exit\n");
+        return 0;
+    }
+    else if (0 == strcmp(argv[1], "sh")) {
+        return mksh_main(argc - 1, argv + 1);
+    }
+    else if (0 == strcmp(argv[1], "sshd")) {
+        char *addr_port = (char *)"2222";
+        if (argc >= 3) {
+            if (0 == strcmp(argv[2], "-h")) {
+                printf("USAGE: forkless sshd [PORT]\n");
+                printf("dropbear ssh server\n\n");
+                printf("COMMANDs:\n");
+                printf("  sh   [ARG...]  shell\n");
+                printf("  sshd [PORT]    ssh server\n");
+                printf("\n");
+                printf("Options:\n");
+                printf("  -h             display this help and exit\n");
+                return 0;
+            }
+
+            addr_port = argv[2];
+            // fprintf(stderr, "forkless: sshd: invalid argument '%s'\n", argv[2]);
+            // fprintf(stderr, "Try 'forkless sshd -h' for more information.\n");
+            // return 1;
+        }
+        char *nargv[] = {
+            argv[0],
+            //"-vvvvvv",
+            "-F",
+            "-E",
+            "-p",
+            addr_port,
+            NULL
+        };
+        return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
+    }
     
-    char *nargv[] = {
-        argv[0],
-        //"-vvvvvv",
-        "-F",
-        "-E",
-        "-p",
-        addr_port,
-        NULL
-    };
-    return dropbear_main(sizeof(nargv)/sizeof(char *) - 1, nargv);
+    fprintf(stderr, "forkless: invalid argument '%s'\n", argv[1]);
+err:
+    fprintf(stderr, "Try 'forkless -h' for more information.\n");
+    return 1;
 }
