@@ -18,7 +18,7 @@
     
 void _tvm_register_cow(void *(*getptr_fn)(), unsigned size, void (*init_fn)(), int deepcopy, char *name);
     
-void tvm_init();
+void tvm_init(const char *init_comm);
 
 #define tvm_environ (*(_tvm_environ()))
 char ***_tvm_environ();

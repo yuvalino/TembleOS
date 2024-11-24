@@ -64,7 +64,7 @@ As you can see in `main.c`, adding a new program is easy:
 ```c
 int main(int argc, char **argv)
 {
-    tvm_init();
+    tvm_init("forkless");
     tvm_register_program("/bin/sh", (main_func_t) mksh_main);
     tvm_register_program("/usr/bin/scp", (main_func_t) scp_main);
 

@@ -787,6 +787,7 @@ struct task {
     pid_t tsk_sid;
     pid_t tsk_pgid;
     char **tsk_environ;
+    char tsk_comm[16];
 };
 
 static pthread_t main_pthread;
@@ -902,6 +903,7 @@ static struct task *taskalloc()
         t->tsk_sid = current->tsk_sid;
         t->tsk_pgid = current->tsk_pgid;
         t->tsk_state = current->tsk_state & TS_CTTY;
+        memcpy(t->tsk_comm, current->tsk_comm, sizeof(t->tsk_comm));
 
         t->tsk_environ = copyenv(current->tsk_environ);
         if (!t->tsk_environ)
@@ -3179,6 +3181,189 @@ pid_t fork(void)
 }
 
 /////////////
+// TVM builtin
+/////////////
+
+static int tvm_ps(int argc, char **argv)
+{
+    struct task *t = NULL;
+    pthread_mutex_lock(&tasks_lock);
+
+    struct {
+        const char *n;
+        int right;
+        int verbose;
+ 
+        int _width;
+    } cols[] = {
+        { .n="PID",  .right=1 },
+        { .n="PPID", .right=1 },
+        { .n="SID",  .right=1, .verbose=1 },
+        { .n="PGID", .right=1, .verbose=1 },
+        { .n="TTY",  .verbose=1 },
+        { .n="CMD" },
+    };
+#define COLN (sizeof(cols)/sizeof(cols[0]))
+
+    // init columns and header row
+    char **rows = calloc(1 * COLN, sizeof(const char *));
+    int rown = 1;
+    if (!rows)
+        goto err;
+    for (int i = 0; i < COLN; i++) {
+        cols[i]._width = strlen(cols[i].n);
+        if (!(rows[i] = strdup(cols[i].n)))
+            goto err;
+    }
+
+    // iterate tasks
+    t = main_task;
+    do {
+        rows = realloc(rows, (rown + 1) * COLN * sizeof(const char *));
+        if (!rows) {
+            t = NULL;
+            goto err;
+        }
+        memset(rows + (rown * COLN), 0, COLN * sizeof(const char *));
+        int r = rown++;
+
+        task_lock(t);
+        for (int c = 0; c < COLN; c++) {
+            char **cellp = rows + r*COLN + c;
+
+            if (0 == strcmp(cols[c].n, "PID")) {
+                if (-1 == asprintf(cellp, "%d", t->tsk_pid))
+                    goto err;
+            }
+
+            else if (0 == strcmp(cols[c].n, "PPID")) {
+                if (-1 == asprintf(cellp, "%d", (t->tsk_parent ? t->tsk_parent->tsk_pid : 1)))
+                    goto err;
+            }
+
+            else if (0 == strcmp(cols[c].n, "SID")) {
+                if (-1 == asprintf(cellp, "%d", t->tsk_sid))
+                    goto err;
+            }
+
+            else if (0 == strcmp(cols[c].n, "PGID")) {
+                if (-1 == asprintf(cellp, "%d", t->tsk_pgid))
+                    goto err;
+            }
+
+            else if (0 == strcmp(cols[c].n, "TTY")) {
+                if (-1 == asprintf(cellp, "?")) // TODO
+                    goto err;
+            }
+
+            else if (0 == strcmp(cols[c].n, "CMD")) {
+                if (t->tsk_state & TS_ZOMBIE) {
+                    int commlen = strnlen(t->tsk_comm, sizeof(t->tsk_comm));
+                    if (!(*cellp = malloc(commlen + 3)))
+                        goto err;
+                    memcpy((*cellp)+1, t->tsk_comm, commlen);
+                    (*cellp)[0] = '[';
+                    (*cellp)[commlen + 1] = ']';
+                    (*cellp)[commlen + 2] = 0;
+                }
+                else {
+                    if (!(*cellp = strndup(t->tsk_comm, sizeof(t->tsk_comm))))
+                        goto err;
+                }
+            }
+
+            int celln = ((*cellp) ? strlen(*cellp) : 0);
+            if (celln > cols[c]._width)
+                cols[c]._width = celln;
+
+        }
+        task_unlock(t);
+
+        t = list_next_entry(t, tsk_list);
+    }
+    while (!list_entry_is_head(t, &main_task->tsk_list, tsk_list));
+    t = NULL;
+
+    // print all rows
+    for (int r = 0; r < rown; r++) {
+        printf("  ");
+        int first = 1;
+        for (int c = 0; c < COLN; c++) {
+            if (cols[c].verbose && argc <= 1)
+                continue;
+            
+            if (!first)
+                putchar(' ');
+            first = 0;
+            
+            char *cell = rows[r*COLN + c];
+            int celln = (cell ? strlen(cell) : 0);
+
+            if (cols[c].right)
+                for (int i = celln; i < cols[c]._width; i++)
+                    putchar(' ');
+
+            if (cell) {
+                size_t towrite = ((celln > cols[c]._width) ? cols[c]._width : celln);
+                if (towrite != fwrite(cell, 1, towrite, stdout))
+                    goto err;
+            }
+            
+            if (!cols[c].right)
+                for (int i = celln; i < cols[c]._width; i++)
+                    putchar(' ');
+        }
+        putchar('\n');
+    }
+
+    // cleanup and exit
+    if (t)
+        task_unlock(t);
+    if (rows) {
+        for (int i = 0; i < (rown * COLN); i++)
+            free(rows[i]);
+        free(rows);
+    }
+    pthread_mutex_unlock(&tasks_lock);
+    return 0;
+err:
+    perror("tvm");
+    if (t)
+        task_unlock(t);
+    if (rows) {
+        for (int i = 0; i < (rown * COLN); i++)
+            free(rows[i]);
+        free(rows);
+    }
+    pthread_mutex_unlock(&tasks_lock);
+    return 1;
+#undef COLN
+}
+
+static int tvm_main(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "USAGE: tvm COMMAND\n");
+        return 1;
+    }
+
+    if (0 == strcmp(argv[1], "-h")) {
+        printf("USAGE: tvm COMMAND\n");
+        printf("TembleOS Virtual Machine Diagnostics\n\n");
+        printf("COMMANDs:\n");
+        printf("  ps             tasks list\n");
+        printf("\n");
+        return 0;
+    }
+
+    if (0 == strcmp(argv[1], "ps")) return tvm_ps(argc - 1, argv + 1);
+    
+    fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
+    fprintf(stderr, "Try 'tvm -h' for more information.\n");
+    return 1;
+}
+
+/////////////
 // API functions
 /////////////
 
@@ -3186,10 +3371,11 @@ pid_t fork(void)
  * I have no idea why `__panic()` is here and at this point, I'm too afraid to ask.
  */
 
-void tvm_init()
+void tvm_init(const char *init_comm)
 {
     main_pthread = pthread_self();
     current = taskalloc();  // special initialization for main thread
+    strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
 
     cow_run_init_funcs(); // initialize copy-on-write vars with init statements
 
@@ -3210,6 +3396,8 @@ void tvm_init()
     }
 
     task_unlock(current);
+
+    tvm_register_program("/usr/bin/tvm", (main_func_t) tvm_main);
 }
 
 char ***_tvm_environ()
@@ -4687,6 +4875,16 @@ int execve(const char *pathname, char *const argv[], char *const envp[])
     }
 
     // No failing from here!
+
+    const char *basename = (const char *)strrchr(pathname, '/');
+    if (!basename)
+        basename = pathname;
+    else
+        basename++;
+    task_lock(current);
+    memset(current->tsk_comm, 0, sizeof(current->tsk_comm));
+    strncpy(current->tsk_comm, basename, sizeof(current->tsk_comm));
+    task_unlock(current);
 
     for (int i = 0; i < MAX_FILES; i++) {
         if (t_fd(i) == -1) 

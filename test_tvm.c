@@ -1089,7 +1089,7 @@ void _add_test(const char *n, void (*f)())
 
 static int runtest_gdb(struct testinfo_t *testinfo, int verbose)
 {
-    tvm_init();
+    tvm_init(testinfo->n);
     testinfo->f();
     return 0;
 }
@@ -1132,7 +1132,7 @@ static int runtest(struct testinfo_t *testinfo, int verbose)
             exit(1);
         }
 
-        tvm_init();
+        tvm_init(testinfo->n);
         testinfo->f();
         exit(0);
     }
