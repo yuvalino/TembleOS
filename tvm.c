@@ -3181,82 +3181,193 @@ pid_t fork(void)
 }
 
 /////////////
-// TVM builtin
+// TVM builtins
 /////////////
+
+#define CCAL_LEFT  0
+#define CCAL_RIGHT 1
+struct cli_column {
+    const char *cc_title;
+    int cc_align; // CCAL_*
+    int cc_verbose;
+};
+
+struct cli_table {
+    struct { 
+        struct cli_column desc;
+        int currw;
+    }     *ct_cols;
+    size_t ct_coln;
+    char **ct_rows;
+    size_t ct_rown;
+};
+
+#define CT_CELL(Tbl, Row, Col) ((Tbl)->ct_rows[(Tbl)->ct_coln * (Row) + (Col)])
+#define CT_COL_FOR_CELL(Tbl, Cell) (&((Tbl)->ct_cols[((Cell - (Tbl)->ct_rows) % (Tbl)->ct_coln)]))
+#define CT_ROW_FOR_EACH(Head, Tbl, Row) for ( \
+    (Head) = (Row); \
+    ({ \
+        if ((Head) > (Row) && (Head)[-1]) { \
+            size_t __CELLN = strlen((Head)[-1]); \
+            if (__CELLN > CT_COL_FOR_CELL((Tbl), ((Head)-1))->currw) \
+                CT_COL_FOR_CELL((Tbl), ((Head)-1))->currw = __CELLN; \
+        }; \
+        (Head); \
+    }) < ((Row) + (Tbl)->ct_coln); \
+    (Head)++  )
+#define CT_IS_CELL(Tbl, Cell, ColNameToCheck) (0 == strcmp(ColNameToCheck, CT_COL_FOR_CELL((Tbl), (Cell))->desc.cc_title))
+
+static int cli_table_dealloc(struct cli_table *tbl)
+{
+    if (tbl->ct_rows) {
+        for (int i = 0; i < (tbl->ct_coln * tbl->ct_rown); i++)
+            free(tbl->ct_rows[i]);
+        free(tbl->ct_rows);
+    }
+
+    if (tbl->ct_cols)
+        free(tbl->ct_cols);
+}
+
+static int cli_table_alloc(struct cli_column *cols, size_t coln, struct cli_table *out_tbl)
+{
+    int ret = -1;
+    struct cli_table tbl = { .ct_coln = coln , .ct_rown = 1 };
+
+    tbl.ct_cols = calloc(tbl.ct_coln, sizeof(*tbl.ct_cols));
+    if (!tbl.ct_cols)
+        goto err;
+
+    tbl.ct_rows = calloc(1 * tbl.ct_coln, sizeof(const char *));
+    if (!tbl.ct_rows)
+        goto err;
+    
+    // init columns and header row
+    for (int i = 0; i < tbl.ct_coln; i++) {
+        memcpy(&tbl.ct_cols[i].desc, cols + i, sizeof(*cols));
+        tbl.ct_cols[i].currw = strlen(tbl.ct_cols[i].desc.cc_title); 
+        if (!(CT_CELL(&tbl, 0, i) = strdup(tbl.ct_cols[i].desc.cc_title)))
+            goto err;
+    }
+
+    memcpy(out_tbl, &tbl, sizeof(tbl));
+    ret = 0;
+err:
+    if (ret)
+        cli_table_dealloc(&tbl);
+    
+    return ret;
+}
+
+static char **cli_table_new_row(struct cli_table *tbl) {
+    char **rowp = NULL;
+
+    if (!(tbl->ct_rows = realloc(tbl->ct_rows, (tbl->ct_rown + 1) * tbl->ct_coln * sizeof(const char *))))
+        goto err;
+    
+    memset(tbl->ct_rows + (tbl->ct_rown * tbl->ct_coln), 0, tbl->ct_coln * sizeof(const char *));
+
+    rowp = &CT_CELL(tbl, tbl->ct_rown, 0);
+    ++tbl->ct_rown;
+err:
+    return rowp;
+}
+
+static int cli_table_print(struct cli_table *tbl, int verbose) {
+    int ret = -1;
+
+    // print all rows
+    for (int r = 0; r < tbl->ct_rown; r++) {
+        printf("  ");
+        int first = 1;
+        for (int c = 0; c < tbl->ct_coln; c++) {
+            if (tbl->ct_cols[c].desc.cc_verbose && !verbose)
+                continue;
+            
+            if (!first)
+                putchar(' ');
+            first = 0;
+            
+            char *cell = CT_CELL(tbl, r, c);
+            int celln = (cell ? strlen(cell) : 0);
+
+            if (tbl->ct_cols[c].desc.cc_align == CCAL_RIGHT)
+                for (int i = celln; i < tbl->ct_cols[c].currw; i++)
+                    putchar(' ');
+
+            if (cell) {
+                size_t towrite = ((celln > tbl->ct_cols[c].currw) ? tbl->ct_cols[c].currw : celln);
+                if (towrite != fwrite(cell, 1, towrite, stdout))
+                    goto err;
+            }
+            
+            if (tbl->ct_cols[c].desc.cc_align == CCAL_LEFT)
+                for (int i = celln; i < tbl->ct_cols[c].currw; i++)
+                    putchar(' ');
+        }
+        putchar('\n');
+    }
+
+    ret = 0;
+err:
+    return ret;
+}
 
 static int tvm_ps(int argc, char **argv)
 {
+    int ret = 1;
     struct task *t = NULL;
     pthread_mutex_lock(&tasks_lock);
 
-    struct {
-        const char *n;
-        int right;
-        int verbose;
- 
-        int _width;
-    } cols[] = {
-        { .n="PID",  .right=1 },
-        { .n="PPID", .right=1 },
-        { .n="SID",  .right=1, .verbose=1 },
-        { .n="PGID", .right=1, .verbose=1 },
-        { .n="TTY",  .verbose=1 },
-        { .n="CMD" },
+    struct cli_column cols[] = {
+        { .cc_title="PID",  .cc_align=CCAL_RIGHT },
+        { .cc_title="PPID", .cc_align=CCAL_RIGHT },
+        { .cc_title="SID",  .cc_align=CCAL_RIGHT, .cc_verbose=1 },
+        { .cc_title="PGID", .cc_align=CCAL_RIGHT, .cc_verbose=1 },
+        { .cc_title="TTY",  .cc_verbose=1 },
+        { .cc_title="CMD" },
     };
-#define COLN (sizeof(cols)/sizeof(cols[0]))
-
-    // init columns and header row
-    char **rows = calloc(1 * COLN, sizeof(const char *));
-    int rown = 1;
-    if (!rows)
+    struct cli_table tbl = {0};
+    if (cli_table_alloc(cols, sizeof(cols)/sizeof(cols[0]), &tbl))
         goto err;
-    for (int i = 0; i < COLN; i++) {
-        cols[i]._width = strlen(cols[i].n);
-        if (!(rows[i] = strdup(cols[i].n)))
-            goto err;
-    }
 
     // iterate tasks
     t = main_task;
     do {
-        rows = realloc(rows, (rown + 1) * COLN * sizeof(const char *));
-        if (!rows) {
-            t = NULL;
-            goto err;
-        }
-        memset(rows + (rown * COLN), 0, COLN * sizeof(const char *));
-        int r = rown++;
-
         task_lock(t);
-        for (int c = 0; c < COLN; c++) {
-            char **cellp = rows + r*COLN + c;
 
-            if (0 == strcmp(cols[c].n, "PID")) {
+        char **rowp = cli_table_new_row(&tbl);
+        if (!rowp)
+            goto err;
+
+        char **cellp;
+        CT_ROW_FOR_EACH(cellp, &tbl, rowp) {
+            if (CT_IS_CELL(&tbl, cellp, "PID")) {
                 if (-1 == asprintf(cellp, "%d", t->tsk_pid))
                     goto err;
             }
 
-            else if (0 == strcmp(cols[c].n, "PPID")) {
+            else if (CT_IS_CELL(&tbl, cellp, "PPID")) {
                 if (-1 == asprintf(cellp, "%d", (t->tsk_parent ? t->tsk_parent->tsk_pid : 1)))
                     goto err;
             }
 
-            else if (0 == strcmp(cols[c].n, "SID")) {
+            else if (CT_IS_CELL(&tbl, cellp, "SID")) {
                 if (-1 == asprintf(cellp, "%d", t->tsk_sid))
                     goto err;
             }
 
-            else if (0 == strcmp(cols[c].n, "PGID")) {
+            else if (CT_IS_CELL(&tbl, cellp, "PGID")) {
                 if (-1 == asprintf(cellp, "%d", t->tsk_pgid))
                     goto err;
             }
 
-            else if (0 == strcmp(cols[c].n, "TTY")) {
+            else if (CT_IS_CELL(&tbl, cellp, "TTY")) {
                 if (-1 == asprintf(cellp, "?")) // TODO
                     goto err;
             }
 
-            else if (0 == strcmp(cols[c].n, "CMD")) {
+            else if (CT_IS_CELL(&tbl, cellp, "CMD")) {
                 if (t->tsk_state & TS_ZOMBIE) {
                     int commlen = strnlen(t->tsk_comm, sizeof(t->tsk_comm));
                     if (!(*cellp = malloc(commlen + 3)))
@@ -3271,73 +3382,32 @@ static int tvm_ps(int argc, char **argv)
                         goto err;
                 }
             }
-
-            int celln = ((*cellp) ? strlen(*cellp) : 0);
-            if (celln > cols[c]._width)
-                cols[c]._width = celln;
-
         }
+        
         task_unlock(t);
-
-        t = list_next_entry(t, tsk_list);
     }
-    while (!list_entry_is_head(t, &main_task->tsk_list, tsk_list));
+    while ( ({ t = list_next_entry(t, tsk_list); !list_entry_is_head(t, &main_task->tsk_list, tsk_list); }) );
+
     t = NULL;
 
-    // print all rows
-    for (int r = 0; r < rown; r++) {
-        printf("  ");
-        int first = 1;
-        for (int c = 0; c < COLN; c++) {
-            if (cols[c].verbose && argc <= 1)
-                continue;
-            
-            if (!first)
-                putchar(' ');
-            first = 0;
-            
-            char *cell = rows[r*COLN + c];
-            int celln = (cell ? strlen(cell) : 0);
+    if (0 != cli_table_print(&tbl, argc > 1))
+        goto err;
 
-            if (cols[c].right)
-                for (int i = celln; i < cols[c]._width; i++)
-                    putchar(' ');
-
-            if (cell) {
-                size_t towrite = ((celln > cols[c]._width) ? cols[c]._width : celln);
-                if (towrite != fwrite(cell, 1, towrite, stdout))
-                    goto err;
-            }
-            
-            if (!cols[c].right)
-                for (int i = celln; i < cols[c]._width; i++)
-                    putchar(' ');
-        }
-        putchar('\n');
-    }
-
-    // cleanup and exit
-    if (t)
-        task_unlock(t);
-    if (rows) {
-        for (int i = 0; i < (rown * COLN); i++)
-            free(rows[i]);
-        free(rows);
-    }
-    pthread_mutex_unlock(&tasks_lock);
-    return 0;
+    ret = 0;
 err:
-    perror("tvm");
+    if (ret)
+        perror("tvm");
     if (t)
         task_unlock(t);
-    if (rows) {
-        for (int i = 0; i < (rown * COLN); i++)
-            free(rows[i]);
-        free(rows);
-    }
+    cli_table_dealloc(&tbl);
     pthread_mutex_unlock(&tasks_lock);
-    return 1;
-#undef COLN
+    return ret;
+}
+
+static int tvm_lsof(int argc, char **argv)
+{
+    int ret = 1;
+    return ret;
 }
 
 static int tvm_main(int argc, char **argv)
@@ -3352,11 +3422,13 @@ static int tvm_main(int argc, char **argv)
         printf("TembleOS Virtual Machine Diagnostics\n\n");
         printf("COMMANDs:\n");
         printf("  ps             tasks list\n");
+        printf("  lsof           fd list\n");
         printf("\n");
         return 0;
     }
 
     if (0 == strcmp(argv[1], "ps")) return tvm_ps(argc - 1, argv + 1);
+    if (0 == strcmp(argv[1], "lsof")) return tvm_lsof(argc - 1, argv + 1);
     
     fprintf(stderr, "tvm: invalid argument '%s'\n", argv[1]);
     fprintf(stderr, "Try 'tvm -h' for more information.\n");
