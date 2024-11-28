@@ -32,6 +32,7 @@
 
 #if defined(__APPLE__)
 #include <util.h>
+#include <libproc.h>
 #elif defined(__linux__)
 #include <pty.h>
 #endif
@@ -420,6 +421,100 @@ static int intparse(const char *s, long long *out, int base)
     *out = r;
     return 0;
 }
+
+struct fdentry {
+    int fd;
+};
+
+#if defined(__linux__)
+static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
+{
+    int ret = -1;
+    DIR *dirp = NULL;
+    struct dirent *dent = NULL;
+
+    struct fdentry *fdt = NULL;
+    size_t fdn = 0;
+
+    if (!(dirp = opendir("/proc/self/fd")))
+        goto err;
+    
+    while (1) {
+        errno = 0;
+        if (!(dent = readdir(dirp))) {
+            if (errno)
+                goto err;
+            break;
+        }
+
+        if (0 == strcmp(dent->d_name, ".") || 0 == strcmp(dent->d_name, ".."))
+            continue;
+
+        long long fd;
+        if (intparse(dent->d_name, &fd, 10))
+            goto err;
+        
+        if (dirfd(dirp) == fd)
+            continue;
+
+        struct fdentry fde = {.fd = (int)fd};
+        if (!(fdt = realloc(fdt, sizeof(*fdt) * (fdn + 1))))
+            goto err;
+
+        memcpy(fdt + fdn, &fde, sizeof(*fdt));
+        fdn++;
+    }
+
+    *out_fdt = fdt;
+    *out_fdn = fdn;    
+    ret = 0;
+err:
+    if (ret)
+        free(fdt);
+    if (dirp)
+        closedir(dirp);
+    return ret;
+}
+#elif defined(__APPLE__)
+static int read_fdtable(struct fdentry **out_fdt, size_t *out_fdn)
+{
+    int ret = -1;
+    struct proc_fdinfo *fdinfos = NULL;
+    struct fdentry *fdt = NULL;
+    size_t fdn = 0;
+    int size = -1;
+    
+    size = proc_pidinfo(CALL_FUNC(getpid), PROC_PIDLISTFDS, 0, 0, 0);
+    if (size < 0)
+        goto err;
+    
+    if (!(fdinfos = malloc(size)))
+        goto err;
+
+    size = proc_pidinfo(CALL_FUNC(getpid), PROC_PIDLISTFDS, 0, fdinfos, size);
+    if (size < 0)
+        goto err;
+
+    for (int i = 0; i < (size / sizeof(*fdinfos)); i++) {
+        struct fdentry fde = {.fd = fdinfos[i].proc_fd};
+        if (!(fdt = realloc(fdt, sizeof(*fdt) * (fdn + 1))))
+            goto err;
+
+        memcpy(fdt + fdn, &fde, sizeof(*fdt));
+        fdn++;
+    }
+
+    *out_fdt = fdt;
+    *out_fdn = fdn;    
+    ret = 0;
+err:
+    if (ret)
+        free(fdt);
+    if (fdinfos)
+        free(fdinfos);
+    return ret;
+}
+#endif
 
 /////////////
 // Jmpbuf manipulation
@@ -1088,6 +1183,37 @@ static struct task *task_for_pid(pid_t pid, int dolocktasks) {
         pthread_mutex_unlock(&tasks_lock);
 
     return t;
+}
+
+/**
+ * tasks_lock must be locked (or dolocktasks=1)
+ * returns locked task
+ */
+static struct task *task_for_rfd(int rfd, int dolocktasks, int *out_nfd) {
+    if (rfd < 0)
+        return NULL;
+    
+    if (dolocktasks)
+        pthread_mutex_lock(&tasks_lock);
+    
+    struct task *t = main_task;
+    do {
+        task_lock(t);
+        for (int nfd = 0; nfd < MAX_FILES; nfd++) {
+            if ((t->tsk_fd[nfd] >= 0) && (t->tsk_fd[nfd] & ~TFD_MASK) == rfd) {
+                if (dolocktasks)
+                    pthread_mutex_unlock(&tasks_lock);
+                *out_nfd = nfd;
+                return t;
+            }
+        }
+        task_unlock(t);
+    }
+    while ( ({ t = list_next_entry(t, tsk_list); !list_entry_is_head(t, &main_task->tsk_list, tsk_list); }) );
+
+    if (dolocktasks)
+        pthread_mutex_unlock(&tasks_lock);
+    return NULL;
 }
 
 /**
@@ -3396,7 +3522,7 @@ static int tvm_ps(int argc, char **argv)
     ret = 0;
 err:
     if (ret)
-        perror("tvm");
+        perror("tvm: ps");
     if (t)
         task_unlock(t);
     cli_table_dealloc(&tbl);
@@ -3404,9 +3530,174 @@ err:
     return ret;
 }
 
+enum {
+    LSOFT_UNKNOWN,
+    LSOFT_PROC,
+    LSOFT_PTY,
+};
+
 static int tvm_lsof(int argc, char **argv)
 {
     int ret = 1;
+    struct fdentry *fdt = NULL;
+    size_t fdn = 0;
+    struct {
+        int rfd;
+        int type;
+        union {
+            struct {
+                int nfd;
+                char *fdtype;
+                int pid;
+                char comm[16+1];
+            } proc;
+            struct {
+                int mfd;
+                pid_t sid;
+                char *end;
+            } tty;
+        };
+    } *fdr = NULL;
+
+    int verbose = argc > 1;
+
+    pthread_mutex_lock(&tasks_lock);
+
+    if (read_fdtable(&fdt, &fdn))
+        goto err;
+    
+    if (!(fdr = calloc(sizeof(*fdr), fdn)))
+        goto err;
+    
+    for (int i = 0; i < fdn; i++) {
+        fdr[i].rfd = fdt[i].fd;
+        fdr[i].type = LSOFT_UNKNOWN;
+
+        int nfd;
+        struct task *t;
+        if (t = task_for_rfd(fdr[i].rfd, 0, &nfd)) {
+            fdr[i].type = LSOFT_PROC;
+            fdr[i].proc.nfd = nfd;
+            fdr[i].proc.fdtype = "unknown_type";
+            fdr[i].proc.pid = t->tsk_pid;
+            memcpy(fdr[i].proc.comm, t->tsk_comm, sizeof(t->tsk_comm));
+            fdr[i].proc.comm[sizeof(t->tsk_comm)] = 0;
+            
+            if ((t->tsk_fd[nfd] & TFD_MASK) == 0)
+                fdr[i].proc.fdtype = NULL;
+            else if ((t->tsk_fd[nfd] & TFD_MASK) == TFD_TTY)
+                fdr[i].proc.fdtype = "tty";
+            
+            task_unlock(t);
+            continue;
+        }
+        
+        struct tty *tt;
+        if (tt = tty_for_fd(fdr[i].rfd, TTM_MASTER)) {
+            fdr[i].type = LSOFT_PTY;
+            fdr[i].tty.mfd = tt->t_mfd;
+            fdr[i].tty.sid = tt->t_sid;
+            fdr[i].tty.end = "master";
+            tty_unlock(tt);
+            continue;
+        }
+        if (tt = tty_for_fd(fdr[i].rfd, TTM_SLAVE)) {
+            fdr[i].type = LSOFT_PTY;
+            fdr[i].tty.mfd = tt->t_mfd;
+            fdr[i].tty.sid = tt->t_pgid;
+            fdr[i].tty.end = "slave";
+            tty_unlock(tt);
+            continue;
+        }
+    }
+
+    // no longer needed, copied to `fdr`
+    free(fdt);
+    fdt = NULL;
+
+    struct cli_column cols[] = {
+        { .cc_title="RFD",  .cc_align=CCAL_RIGHT },
+        { .cc_title="PID",  .cc_align=CCAL_RIGHT },
+        { .cc_title="VAL",  .cc_align=CCAL_RIGHT },
+        { .cc_title="TYPE", .cc_align=CCAL_RIGHT },
+    };
+    struct cli_table tbl = {0};
+    if (cli_table_alloc(cols, sizeof(cols)/sizeof(cols[0]), &tbl))
+        goto err;
+
+    // iterate fds
+    for (int i = 0; i < fdn; i++)
+    {
+        char **rowp = cli_table_new_row(&tbl);
+        if (!rowp)
+            goto err;
+
+        char **cellp;
+        CT_ROW_FOR_EACH(cellp, &tbl, rowp) {
+            if (CT_IS_CELL(&tbl, cellp, "RFD")) {
+                if (-1 == asprintf(cellp, "%d", fdr[i].rfd))
+                    goto err;
+            }
+
+            if (CT_IS_CELL(&tbl, cellp, "PID")) {
+                if (fdr[i].type == LSOFT_PROC) {
+                    if (verbose) {
+                        if (-1 == asprintf(cellp, "%s/%d", fdr[i].proc.comm, fdr[i].proc.pid))
+                            goto err;
+                    }
+                    else {
+                        if (-1 == asprintf(cellp, "%d", fdr[i].proc.pid))
+                            goto err;
+                    }
+                }
+                else if (fdr[i].type == LSOFT_PTY) {
+                    if (fdr[i].tty.sid > 0) {
+                        if (-1 == asprintf(cellp, "%d/pty", fdr[i].tty.sid))
+                            goto err;
+                    }
+                    else {
+                        if (-1 == asprintf(cellp, "-/pty"))
+                            goto err;
+                    }
+                }
+            }
+
+            if (CT_IS_CELL(&tbl, cellp, "VAL")) {
+                if (fdr[i].type == LSOFT_PROC) {
+                    if (-1 == asprintf(cellp, "%d", fdr[i].proc.nfd))
+                            goto err;
+                }
+                else if (fdr[i].type == LSOFT_PTY) {
+                    if (-1 == asprintf(cellp, "/dev/pts%d", fdr[i].tty.mfd))
+                        goto err;
+                }
+            }
+
+            if (CT_IS_CELL(&tbl, cellp, "TYPE")) {
+                if (fdr[i].type == LSOFT_PROC) {
+                    if (fdr[i].proc.fdtype)
+                        if (-1 == asprintf(cellp, "%s", fdr[i].proc.fdtype))
+                                goto err;
+                }
+                else if (fdr[i].type == LSOFT_PTY) {
+                    if (-1 == asprintf(cellp, "%s", fdr[i].tty.end))
+                        goto err;
+                }
+            }
+        }
+    }
+
+    if (0 != cli_table_print(&tbl, verbose))
+        goto err;
+
+    ret = 0;
+err:
+    if (ret)
+        perror("tvm: lsof");
+    cli_table_dealloc(&tbl);
+    if (fdt)
+        free(fdt);
+    pthread_mutex_unlock(&tasks_lock);
     return ret;
 }
 
