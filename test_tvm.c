@@ -96,6 +96,34 @@ TEST(ProcExit) {
     printf("done\n");
 }
 
+volatile int my_fork_count = 0;
+pid_t my_fork() {
+    pid_t p = fork();
+    if (-1 == p)
+        return -1;
+    
+    if (p != 0)
+        my_fork_count++;
+
+    return p;
+}
+
+TEST(ProcForkFrames) {
+    pid_t p = my_fork();
+    ASSERT_NEQ(p, -1);
+    
+    if (!p) {
+        exit(26);
+    }
+
+    ASSERT_EQ(my_fork_count, 1);
+
+    int s;
+    ASSERT_EQ(p, wait(&s));
+    ASSERT_EQ(WIFEXITED(s), 1);
+    ASSERT_EQ(WEXITSTATUS(s), 26);
+}
+
 TEST(ProcWNOHANG) {
     pid_t p = fork();
     ASSERT_NEQ(p, -1);

@@ -2687,7 +2687,7 @@ static int tty_slavename(int fd, char *buf, size_t buflen)
  * 3. On fork(), get all global variable pointers from parent
  * 4. On fork(), memcpy() all parent global variables to the child
  * 5. On fork(), iterate every global variable and recursively deep-copy malloc'd buffer pointers
- * 6. On fork(), iterate copied stack frame (see `Forkless API` section) and deep-copy malloc'd pointers as-well
+ * 6. On fork(), iterate copied stack frames (see `Fork` section) and deep-copy malloc'd pointers as-well
  * 
  * We also use a "deep-copy" cache (struct cow_deepcopy_ctx) so we properly handled pointers that appear twice while deep-copying.
  * 
@@ -3033,12 +3033,18 @@ struct fork_arg {
     struct task *task;
     struct pthread_entry *pentry;
     jmp_buf jmpbuf;
-    void **fork_fp;
-    void **caller_fp;
+    void **parent_top_frame;
+    void **parent_fork_frame;
     void **cow_data;
 };
 
-#define FRAME_SIZE 0x1000
+struct pidcond_t {
+    pid_t pid;
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+};
+
+static __thread void **top_frame = NULL;
 
 static void *fork_entry(struct fork_arg *arg)
 {
@@ -3059,39 +3065,36 @@ static void *fork_entry(struct fork_arg *arg)
         panic("cow_set_thread_ptrs");
     
     // setup copied stack frames
-    void *curr_fp = (void **)__builtin_frame_address(0);
-    char fake_frame[FRAME_SIZE] __attribute__((aligned(16))) = {0};
+    top_frame = (void **)__builtin_frame_address(0);
+    uintptr_t jmpbuf_sp_parent = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf);
+    size_t parent_frames_size = ((uintptr_t)arg->parent_top_frame) + sizeof(void *) - jmpbuf_sp_parent;
 
-    uintptr_t jmpbuf_sp = (uintptr_t)jmpbuf_getstack(&arg->jmpbuf);
-    uintptr_t caller_frame = (uintptr_t)arg->caller_fp;
-    void **new_caller_frame = (void **) (fake_frame + caller_frame - jmpbuf_sp);
-    void **new_fork_frame = (void **) (((char *) arg->fork_fp) + ((uintptr_t) fake_frame) - jmpbuf_sp);
+    // allocate parent frames on the stack (aligned to 16)
+    char *fake_frames = alloca(parent_frames_size + 16);
+    fake_frames += 16 - (((uintptr_t) fake_frames) % 16);
 
-    memcpy(fake_frame, (void *)jmpbuf_sp, caller_frame + sizeof(void *) - jmpbuf_sp);
-    *new_caller_frame = curr_fp;
+    void **adjusted_parent_caller_frame = (void **) (fake_frames + ((uintptr_t)arg->parent_top_frame) - jmpbuf_sp_parent);
+    void **new_fork_frame = (void **) (((char *) arg->parent_fork_frame) + ((uintptr_t) fake_frames) - jmpbuf_sp_parent);
+
+    memcpy(fake_frames, (void *)jmpbuf_sp_parent, parent_frames_size);
+    *adjusted_parent_caller_frame = (void *)top_frame;
 
     // deepcopy stack variables
-    cow_deepcopy((void *) new_fork_frame, ((uintptr_t) new_caller_frame) - ((uintptr_t) new_fork_frame), &dctx);
+    cow_deepcopy((void *) new_fork_frame, ((uintptr_t) adjusted_parent_caller_frame) - ((uintptr_t) new_fork_frame), &dctx);
     free(dctx.ptrs);
     
     // setup jmpbuf with copied stack frames
     jmpbuf_setstack(
         &arg->jmpbuf,
-        (uintptr_t) fake_frame,
-        (uintptr_t) jmpbuf_sp,
-        caller_frame + sizeof(void *) - jmpbuf_sp
+        (uintptr_t) fake_frames,
+        (uintptr_t) jmpbuf_sp_parent,
+        parent_frames_size
     );
     jmpbuf_mangle(&arg->jmpbuf);
 
     // leap of faith back to `fork()` as child
     longjmp(arg->jmpbuf, 1);
 }
-
-struct pidcond_t {
-    pid_t pid;
-    pthread_mutex_t mtx;
-    pthread_cond_t cond;
-};
 
 pid_t fork(void)
 {
@@ -3108,8 +3111,6 @@ pid_t fork(void)
     struct pidcond_t  pidcond     = {.pid = -1, .mtx = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
     struct pidcond_t *pidcondaddr = &pidcond;
 
-    void **curr_fp = (void **)__builtin_frame_address(0);
-
     ret = pthread_attr_init(&pthread_attr);
     if (0 != ret) {
         errno = ret;
@@ -3122,8 +3123,8 @@ pid_t fork(void)
         goto out;
     }
 
-    arg.fork_fp = curr_fp;
-    arg.caller_fp = (void **)(*curr_fp);
+    arg.parent_top_frame = top_frame;
+    arg.parent_fork_frame = (void **)__builtin_frame_address(0);
 
     if (!(arg.pentry = CALL_FUNC(malloc, sizeof(struct pthread_entry))))
         goto out;
@@ -3624,6 +3625,8 @@ void tvm_init(const char *init_comm)
     strncpy(current->tsk_comm, init_comm, sizeof(current->tsk_comm));
 
     cow_run_init_funcs(); // initialize copy-on-write vars with init statements
+
+    top_frame = *((void ***)__builtin_frame_address(0));
 
     task_lock(current);
     
