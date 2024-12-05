@@ -1076,14 +1076,14 @@ static void taskfreelastref(struct task *t, int dolocktasks, int dealloc)
         if (t->tsk_f[i] != NULL)
             CALL_FUNC(fclose, t->tsk_f[i]);
         else if (t->tsk_fd[i] != -1)
-            CALL_FUNC(close, t->tsk_fd[i]);
+            CALL_FUNC(close, t->tsk_fd[i] & ~TFD_MASK);
         t->tsk_fd[i] = -1;
         t->tsk_f[i] = NULL;
     }
 
     for (int i = 3; i < MAX_FILES; i++) {
-        if (t->tsk_fd[i] != -1)
-            CALL_FUNC(close, t->tsk_fd[i]);
+        if (t->tsk_fd[i] > -1)
+            CALL_FUNC(close, t->tsk_fd[i] & ~TFD_MASK);
         t->tsk_fd[i] = -1;
     }
 
