@@ -3015,188 +3015,7 @@ static const char *find_program_pathname(const char *file)
 }
 
 /////////////
-// tvm_pthread_* API
-/////////////
-
-/**
- * This is the bread and butter of `fork()`.
- * 
- * This doesn't try to imitate the `fork()` API and all the parent stack frames fuckfest,
- * but a simple API to create either a thread or a process ontop of `pthread_create` with a start routine,
- * allocating/copying task struct and calling COW logic.
- */
-
-#define TVM_PTHREAD_FORK 1
-
-struct thread_create_arg
-{
-    int flags;
-    struct cow_deepcopy_ctx *cow_context;
-};
-
-struct thread_arg
-{
-    struct thread_create_arg create_arg;
-    struct task *task;
-    struct pthread_entry *pentry;
-    void *(*start_routine) (void *);
-    void *arg;
-    pthread_mutex_t wake_mtx;
-    pthread_cond_t  wake_cond;
-    int wake;
-    void **cow_data;
-};
-
-static void *thread_entry(struct thread_arg *arg)
-{
-    current = arg->task;
-
-    task_lock(current);
-
-    if (current->tsk_pid == -1)
-        current->tsk_pid = __gettid();
-
-    ++current->tsk_pthreads_count;
-    arg->pentry->ptl_value = pthread_self();
-    list_add_tail(&arg->pentry->ptl_entry, &current->tsk_pthreads);
-
-    task_unlock(current);
-
-    struct cow_deepcopy_ctx dctx = {0};
-
-    if (0 != cow_set_thread_ptrs(arg->cow_data, &dctx))
-        panic("cow_set_thread_ptrs");
-
-    // `fork()` needs dctx, so it will use it and free it in the `start_routine`
-    if (arg->create_arg.cow_context)
-        memcpy(arg->create_arg.cow_context, &dctx, sizeof(dctx));
-    else
-        free(dctx.ptrs);
-
-    void *(*start_routine)(void *) = arg->start_routine;
-    void *routine_arg = arg->arg;
-    
-    pthread_mutex_lock(&arg->wake_mtx);
-    arg->wake = 1;
-    pthread_cond_broadcast(&arg->wake_cond);
-    pthread_mutex_unlock(&arg->wake_mtx);
-
-    void *retval = start_routine(routine_arg);
-    pthread_exit(retval);
-}
-
-int tvm_pthread_create_ex(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg, struct thread_create_arg *create_arg)
-{
-    int ret = ENOMEM;
-
-    struct thread_arg *targ = malloc(sizeof(struct thread_arg));
-    if (!targ)
-        goto out;
-
-    if (0 != pthread_mutex_init(&targ->wake_mtx, NULL))
-        goto out;
-
-    if (0 != pthread_cond_init(&targ->wake_cond, NULL))
-        goto out;
-
-    targ->pentry = malloc(sizeof(struct pthread_entry));
-    if (!targ->pentry)
-        goto out;
-
-    memcpy(&targ->create_arg, create_arg, sizeof(*create_arg));
-    if (create_arg->flags & TVM_PTHREAD_FORK)
-    {
-        targ->task = taskalloc();
-        if (!targ->task)
-            goto out;
-        
-        if (0 != cow_get_thread_ptrs(&targ->cow_data)) {
-            goto out;
-        }
-    }
-    else
-    {
-        task_lock(current);
-        ++current->tsk_refcount;
-        targ->task = current;
-        task_unlock(current);
-        
-        targ->cow_data = NULL;
-    }
-
-    targ->start_routine = start_routine;
-    targ->arg = arg;
-    targ->wake = 0;
-
-    ret = CALL_FUNC(pthread_create, thread, attr, (void *(*)(void *))thread_entry, (void *)targ);
-
-    if (0 == ret) {
-        pthread_mutex_lock(&targ->wake_mtx);
-        while (!targ->wake) {
-            pthread_cond_wait(&targ->wake_cond, &targ->wake_mtx);
-        }
-        pthread_mutex_unlock(&targ->wake_mtx);
-    }
-
-out:
-
-    if (targ)
-    {
-        if (ret != 0)
-        {
-            if (create_arg->flags & TVM_PTHREAD_FORK)
-            {
-                if (targ->task)
-                    taskfreelastref(targ->task, 1, 1);
-            }
-            else
-            {
-                if (targ->task) {
-                    task_lock(current);
-                    --current->tsk_refcount;
-                    task_unlock(current);
-                }
-            }
-
-            if (targ->pentry)
-            free(targ->pentry);
-        }
-
-        if (targ->cow_data)
-            free(targ->cow_data);
-
-        free(targ);
-    }
-
-    return ret;
-}
-
-int tvm_pthread_fork(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
-{
-    struct thread_create_arg create_arg = { .flags = TVM_PTHREAD_FORK };
-    return tvm_pthread_create_ex(thread, attr, start_routine, arg, &create_arg);
-}
-
-int tvm_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
-{
-    struct thread_create_arg create_arg = { .flags = 0 };
-    return tvm_pthread_create_ex(thread, attr, start_routine, arg, &create_arg);
-}
-
-__attribute__ ((noreturn))
-void tvm_pthread_exit(void *retval)
-{
-    if (pthread_self() == main_pthread)
-        CALL_FUNC(_exit, (int) ((long) retval));
-    
-    // TODO task_release(current, 1);
-    
-    CALL_FUNC(pthread_exit, retval);
-    __builtin_unreachable();
-}
-
-/////////////
-// Forkless API
+// Fork
 /////////////
 
 /**
@@ -3210,17 +3029,36 @@ void tvm_pthread_exit(void *retval)
 #define FORKLESS_STACK_MAGIC ((uintptr_t)0xCAFEFACF)
 #define DEFAULT_STACK_SIZE (0x1000 * 2000) // 8Mb
 
-struct forkless_arg {
+struct fork_arg {
+    struct task *task;
+    struct pthread_entry *pentry;
     jmp_buf jmpbuf;
     void **fork_fp;
     void **caller_fp;
-    struct cow_deepcopy_ctx dctx;
+    void **cow_data;
 };
 
 #define FRAME_SIZE 0x1000
 
-static void *forkless_entry(struct forkless_arg *arg)
+static void *fork_entry(struct fork_arg *arg)
 {
+    current = arg->task;
+    task_lock(current);
+    
+    // setup task
+    current->tsk_pid = __gettid();
+    ++current->tsk_pthreads_count;
+    arg->pentry->ptl_value = pthread_self();
+    list_add_tail(&arg->pentry->ptl_entry, &current->tsk_pthreads);
+
+    task_unlock(current);
+    
+    // deepcopy global variables
+    struct cow_deepcopy_ctx dctx = {0};
+    if (0 != cow_set_thread_ptrs(arg->cow_data, &dctx))
+        panic("cow_set_thread_ptrs");
+    
+    // setup copied stack frames
     void *curr_fp = (void **)__builtin_frame_address(0);
     char fake_frame[FRAME_SIZE] __attribute__((aligned(16))) = {0};
 
@@ -3232,9 +3070,11 @@ static void *forkless_entry(struct forkless_arg *arg)
     memcpy(fake_frame, (void *)jmpbuf_sp, caller_frame + sizeof(void *) - jmpbuf_sp);
     *new_caller_frame = curr_fp;
 
-    cow_deepcopy((void *) new_fork_frame, ((uintptr_t) new_caller_frame) - ((uintptr_t) new_fork_frame), &arg->dctx);
-    free(arg->dctx.ptrs);
-
+    // deepcopy stack variables
+    cow_deepcopy((void *) new_fork_frame, ((uintptr_t) new_caller_frame) - ((uintptr_t) new_fork_frame), &dctx);
+    free(dctx.ptrs);
+    
+    // setup jmpbuf with copied stack frames
     jmpbuf_setstack(
         &arg->jmpbuf,
         (uintptr_t) fake_frame,
@@ -3243,6 +3083,7 @@ static void *forkless_entry(struct forkless_arg *arg)
     );
     jmpbuf_mangle(&arg->jmpbuf);
 
+    // leap of faith back to `fork()` as child
     longjmp(arg->jmpbuf, 1);
 }
 
@@ -3256,17 +3097,43 @@ pid_t fork(void)
 {
     if (!main_task)
         return CALL_FUNC(fork);
-    
-    struct pidcond_t pidcond = {-1};
-    pthread_mutex_init(&pidcond.mtx, NULL);
-    pthread_cond_init(&pidcond.cond, NULL);
+
+    int ret;
+
+    pthread_t      pthread;
+    pthread_attr_t pthread_attr;
+
+    struct fork_arg arg = {0};
+
+    struct pidcond_t  pidcond     = {.pid = -1, .mtx = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
     struct pidcond_t *pidcondaddr = &pidcond;
 
     void **curr_fp = (void **)__builtin_frame_address(0);
-    struct forkless_arg arg = {
-        .fork_fp = curr_fp,
-        .caller_fp = (void **)(*curr_fp)
-    };
+
+    ret = pthread_attr_init(&pthread_attr);
+    if (0 != ret) {
+        errno = ret;
+        return -1;
+    }
+
+    ret = pthread_attr_setstacksize(&pthread_attr, DEFAULT_STACK_SIZE);
+    if (0 != ret) {
+        errno = ret;
+        goto out;
+    }
+
+    arg.fork_fp = curr_fp;
+    arg.caller_fp = (void **)(*curr_fp);
+
+    if (!(arg.pentry = CALL_FUNC(malloc, sizeof(struct pthread_entry))))
+        goto out;
+    
+    if (!(arg.task = taskalloc()))
+        goto out;
+    
+    if (0 != (cow_get_thread_ptrs(&arg.cow_data)))
+        goto out;
+
     pidcondaddr = (struct pidcond_t *) (((uintptr_t) pidcondaddr) ^ FORKLESS_STACK_MAGIC);
     
     // NOTE: Why do we xor `pidaddr`?
@@ -3275,34 +3142,50 @@ pid_t fork(void)
     //       because we're notifying the parent the child has finished setting up.
 
     if (0 != setjmp(arg.jmpbuf)) {
+        // child
+
         pidcondaddr = (struct pidcond_t *) (((uintptr_t) pidcondaddr) ^ FORKLESS_STACK_MAGIC);
+        
+        // notify parent we're finished by sending him the pid
         pthread_mutex_lock(&pidcondaddr->mtx);
         pidcondaddr->pid = __gettid();
         pthread_cond_broadcast(&pidcondaddr->cond);
         pthread_mutex_unlock(&pidcondaddr->mtx);
+
         return 0;
     }
+
+    // parent
+
     jmpbuf_demangle(&arg.jmpbuf);
 
-    pthread_t thr;
-    struct thread_create_arg create_arg = {
-        .flags = TVM_PTHREAD_FORK,
-        .cow_context = &arg.dctx,
-    };
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, DEFAULT_STACK_SIZE);
-    tvm_pthread_create_ex(&thr, &attr, (void *(*)(void *)) forkless_entry, (void *)&arg, &create_arg);
-    pthread_attr_destroy(&attr);
+    ret = CALL_FUNC(pthread_create, &pthread, &pthread_attr, (void *(*)(void *)) fork_entry, (void *)&arg);
+    if (0 != ret) {
+        errno = ret;
+        goto out;
+    }
     
+    // wait for `pidcond.pid == -1` set by child
     pthread_mutex_lock(&pidcond.mtx);
     while (pidcond.pid == -1) {
         pthread_cond_wait(&pidcond.cond, &pidcond.mtx);
     }
     pthread_mutex_unlock(&pidcond.mtx);
 
-    pthread_mutex_destroy(&pidcond.mtx);
-    pthread_cond_destroy(&pidcond.cond);
+out:
+
+    if (arg.cow_data)
+        free(arg.cow_data);
+    
+    if (-1 == pidcond.pid) {  // on failure
+        if (arg.task)
+            taskfreelastref(arg.task, 1, 1);
+        if (arg.pentry)
+            free(arg.pentry);
+    }
+
+    pthread_attr_destroy(&pthread_attr);
+    
     return pidcond.pid;
 }
 
@@ -4762,10 +4645,21 @@ int ioctl(int fd, unsigned long request, ...)
 }
 
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
-    return tvm_pthread_create(thread, attr, start_routine, arg);
+    if (!main_task)
+        return CALL_FUNC(pthread_create, thread, attr, start_routine, arg);
+    
+    errno = -ENOSYS;
+    return -1;
 }
 
-void pthread_exit(void *retval) { tvm_pthread_exit(retval); }
+void pthread_exit(void *retval)
+{
+    if (!main_task)
+        CALL_FUNC(pthread_exit, retval);
+    
+    panic("pthread_exit not supported");
+    __builtin_unreachable();
+}
 
 void exit(int status) { if (!main_task) CALL_FUNC(exit, status); _exit(status); }
 
