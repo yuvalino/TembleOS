@@ -34,6 +34,9 @@ To run, `$ ./forkless sshd` and an SSH server at port 2222 will start running wi
 - `sh` - MirBSD Korn Shell
   - builtins (`echo`, `export`, `cd`, etc..)
 - `toybox` - `ls`, `cat`, `id`, `grep` etc
+- `tvm` - tvm diagnostics
+  - `tvm ps` - internal process list
+  - `tvm lsof` - internal file-descriptor tables
 
 ### Platforms
 
