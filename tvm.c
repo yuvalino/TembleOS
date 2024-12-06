@@ -80,9 +80,6 @@ static void __panic(const char *m, const char *f, int l);
 
 #define MALLOC_MAGIC ((uintptr_t) 0xFACEFACE)
 
-#define ALIGN(x,a)              __ALIGN_MASK(x,(typeof(x))(a)-1)
-#define __ALIGN_MASK(x,mask)    (((x)+(mask))&~(mask))
-
 /////////////
 // List
 /////////////
@@ -3343,7 +3340,7 @@ struct cli_table {
     (Head)++  )
 #define CT_IS_CELL(Tbl, Cell, ColNameToCheck) (0 == strcmp(ColNameToCheck, CT_COL_FOR_CELL((Tbl), (Cell))->desc.cc_title))
 
-static int cli_table_dealloc(struct cli_table *tbl)
+static void cli_table_dealloc(struct cli_table *tbl)
 {
     if (tbl->ct_rows) {
         for (int i = 0; i < (tbl->ct_coln * tbl->ct_rown); i++)
@@ -3575,7 +3572,7 @@ static int tvm_lsof(int argc, char **argv)
 
         int nfd;
         struct task *t;
-        if (t = task_for_rfd(fdr[i].rfd, 0, &nfd)) {
+        if ((t = task_for_rfd(fdr[i].rfd, 0, &nfd))) {
             fdr[i].type = LSOFT_PROC;
             fdr[i].proc.nfd = nfd;
             fdr[i].proc.fdtype = "unknown_type";
@@ -3593,7 +3590,7 @@ static int tvm_lsof(int argc, char **argv)
         }
         
         struct tty *tt;
-        if (tt = tty_for_fd(fdr[i].rfd, TTM_MASTER)) {
+        if ((tt = tty_for_fd(fdr[i].rfd, TTM_MASTER))) {
             fdr[i].type = LSOFT_PTY;
             fdr[i].tty.mfd = tt->t_mfd;
             fdr[i].tty.sid = tt->t_sid;
@@ -3601,7 +3598,7 @@ static int tvm_lsof(int argc, char **argv)
             tty_unlock(tt);
             continue;
         }
-        if (tt = tty_for_fd(fdr[i].rfd, TTM_SLAVE)) {
+        if ((tt = tty_for_fd(fdr[i].rfd, TTM_SLAVE))) {
             fdr[i].type = LSOFT_PTY;
             fdr[i].tty.mfd = tt->t_mfd;
             fdr[i].tty.sid = tt->t_pgid;

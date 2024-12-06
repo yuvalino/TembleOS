@@ -20,7 +20,7 @@ void xxd(void *addr, int len)
         printf("%08x: ", off);
 
         memset(currptr, ' ', sizeof(currptr)-1); currptr[sizeof(currptr)-1] = 0;
-        for (int i = 0; off < len, i < 8; off++, i++) {
+        for (int i = 0; off < len && i < 8; off++, i++) {
             char a[3];
             snprintf(a, 3, "%02hhx", caddr[off]);
             memcpy(currptr + (2*(7-i)), a, 2);
@@ -31,7 +31,7 @@ void xxd(void *addr, int len)
 
         memset(currptr, ' ', sizeof(currptr)-1);
         if (off < len) {
-            for (int i = 0; off < len, i < 8; off++, i++) {
+            for (int i = 0; off < len && i < 8; off++, i++) {
                 char a[3];
                 snprintf(a, 3, "%02hhx", caddr[off]);
                 memcpy(currptr + (2*(7-i)), a, 2);
