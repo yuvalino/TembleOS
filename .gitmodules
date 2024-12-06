@@ -7,3 +7,6 @@
 [submodule "toybox"]
 	path = toybox
 	url = git@github.com:yuvalino/toybox-forkless.git
+[submodule "rmsh"]
+	path = rmsh
+	url = git@github.com:yuvalino/rmsh.git
